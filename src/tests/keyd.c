@@ -17,29 +17,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "srv.h"
+
 #include "../core/conv.h"
 #include "../clt/adv.h"
-#include "../clt/msg.h"
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 
 #include <errno.h>
-#include <error.h>
-#include <limits.h>
-#include <netdb.h>
-#include <signal.h>
 #include <stdarg.h>
-#include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <unistd.h>
-
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-
-#include <systemd/sd-daemon.h>
 
 #define test(cond, cmd) \
     if (!(cond)) { \
@@ -50,91 +35,6 @@
 #define testg(cond, label) test(cond, goto label)
 #define teste(cond) test(cond, exit(EXIT_FAILURE))
 #define testb(cond) test(cond, return false)
-
-static char tempdir[] = "/var/tmp/tangXXXXXX";
-static pid_t pid;
-
-static EC_KEY *
-keygen(const char *dbdir, const char *name, const char *grpname,
-       const char *use, bool adv)
-{
-    char fname[PATH_MAX];
-    char cmd[PATH_MAX*2];
-    EC_GROUP *grp = NULL;
-    EC_KEY *key = NULL;
-    FILE *f = NULL;
-
-    if (snprintf(fname, sizeof(fname), "%s/%s", dbdir, name) <= 0)
-        return NULL;
-
-    if (snprintf(cmd, sizeof(cmd),
-                 "../tang-key-gen -%c %s %s -f %s >/dev/null",
-                 adv ? 'A' : 'a', grpname, use, fname) <= 0)
-        return NULL;
-
-    if (system(cmd) != 0)
-        return NULL;
-
-    f = fopen(fname, "r");
-    if (!f)
-        return NULL;
-
-    grp = PEM_read_ECPKParameters(f, NULL, NULL, NULL);
-    if (grp) {
-        if (EC_GROUP_get_curve_name(grp) != NID_undef) {
-            key = PEM_read_ECPrivateKey(f, NULL, NULL, NULL);
-            if (key) {
-                if (EC_KEY_set_group(key, grp) <= 0) {
-                    EC_KEY_free(key);
-                    key = NULL;
-                }
-            }
-        }
-    }
-
-    EC_GROUP_free(grp);
-    fclose(f);
-    return key;
-}
-
-static void
-onexit(void)
-{
-    const char *cmd = "rm -rf ";
-    char tmp[strlen(cmd) + strlen(tempdir) + 1];
-    __attribute__((unused)) int r = 0;
-
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-
-    strcpy(tmp, cmd);
-    strcat(tmp, tempdir);
-    r = system(tmp);
-}
-
-static bool
-makesock(int af, const msg_t *p, int fd)
-{
-    const struct addrinfo hnt = { .ai_family = af, .ai_socktype = SOCK_DGRAM };
-    struct addrinfo *addrs = NULL;
-    bool success = false;
-    int sock = -1;
-
-    testg(getaddrinfo(p->hostname, p->service, &hnt, &addrs) == 0, error);
-
-    sock = socket(af, SOCK_DGRAM, 0);
-    testg(sock >= 0, error);
-
-    testg(bind(sock, addrs->ai_addr, addrs->ai_addrlen) == 0, error);
-
-    success = dup2(sock, fd) == fd;
-
-error:
-    freeaddrinfo(addrs);
-    if (!success || sock != fd)
-        close(sock);
-    return success;
-}
 
 static TANG_MSG *
 adv(const msg_t *params, BN_CTX *ctx, ...)
@@ -416,57 +316,39 @@ stage2(const msg_t *params, EC_KEY *reca, EC_KEY *siga,
 int
 main(int argc, char *argv[])
 {
-    msg_t p4 = { .hostname = "127.0.0.1", .service = "5700", .timeout = 1 };
-    msg_t p6 = { .hostname = "::1", .service = "5700", .timeout = 1 };
+    msg_t ipv4 = { .hostname = "127.0.0.1", .service = "5700", .timeout = 1 };
+    msg_t ipv6 = { .hostname = "::1", .service = "5700", .timeout = 1 };
     EC_KEY *reca = NULL;
     EC_KEY *recA = NULL;
     EC_KEY *siga = NULL;
     EC_KEY *sigA = NULL;
     BN_CTX *ctx = NULL;
 
+    srv_setup(&ipv4, &ipv6);
+
     ctx = BN_CTX_new();
     teste(ctx);
 
-    if (!mkdtemp(tempdir))
-        error(EXIT_FAILURE, errno, "Error calling mkdtemp()");
-
-    pid = fork();
-    if (pid < 0)
-        error(EXIT_FAILURE, errno, "Error calling mkdtemp()");
-
-    if (pid == 0) {
-        teste(setenv("LISTEN_FDS", "2", true) == 0);
-        teste(makesock(AF_INET, &p4, SD_LISTEN_FDS_START));
-        teste(makesock(AF_INET6, &p6, SD_LISTEN_FDS_START + 1));
-        execlp("../tang-keyd", "../tang-keyd", "-d", tempdir, NULL);
-        teste(false);
-    }
-
-    atexit(onexit);
-    usleep(100000); /* Let the daemon have time to start. */
-
-    teste(stage0(&p4, ctx));
-    teste(stage0(&p6, ctx));
+    teste(stage0(&ipv4, ctx));
+    teste(stage0(&ipv6, ctx));
 
     /* Make some unadvertised keys. */
-    reca = keygen(tempdir, "reca", "secp384r1", "rec", false);
-    siga = keygen(tempdir, "siga", "secp384r1", "sig", false);
+    reca = srv_keygen("reca", "secp384r1", "rec", false);
     teste(reca);
+    siga = srv_keygen("siga", "secp384r1", "sig", false);
     teste(siga);
-    usleep(100000); /* Let the daemon have time to pick up the new files. */
 
-    teste(stage1(&p4, reca, siga, ctx))
-    teste(stage1(&p6, reca, siga, ctx));
+    teste(stage1(&ipv4, reca, siga, ctx))
+    teste(stage1(&ipv6, reca, siga, ctx));
 
     /* Make some advertised keys. */
-    recA = keygen(tempdir, "recA", "secp384r1", "rec", true);
-    sigA = keygen(tempdir, "sigA", "secp384r1", "sig", true);
+    recA = srv_keygen("recA", "secp384r1", "rec", true);
     teste(recA);
+    sigA = srv_keygen("sigA", "secp384r1", "sig", true);
     teste(sigA);
-    usleep(100000); /* Let the daemon have time to pick up the new files. */
 
-    teste(stage2(&p4, reca, siga, recA, sigA, ctx));
-    teste(stage2(&p6, reca, siga, recA, sigA, ctx));
+    teste(stage2(&ipv4, reca, siga, recA, sigA, ctx));
+    teste(stage2(&ipv6, reca, siga, recA, sigA, ctx));
 
     EC_KEY_free(reca);
     EC_KEY_free(recA);

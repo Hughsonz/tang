@@ -2,6 +2,7 @@ language: c
 before_install:
   - sudo apt-get remove -y 'erlang.*' 'jdk.*' 'openjdk.*' 'ruby.*' 'libqt4.*' google-chrome-stable
   - sudo apt-get remove -y 'postgres.*'
+  - apt-get autoremove
   - sudo sed -i 's|trusty|wily|g' /etc/apt/sources.list
   - sudo apt-get update -y
   - sudo apt-get -o Dpkg::Options::="--force-confnew" dist-upgrade -y

@@ -12,8 +12,8 @@ script:
   - ./configure --prefix=/usr
   - make -k
   - make check
+  - pushd src/tests; strace ./keyd; popd
 sudo: required
 dist: trusty
 compiler:
   - clang
-  - gcc

@@ -6,6 +6,6 @@ check_PROGRAMS = keyd
 
 keyd_LDADD = ../libclt.a ../libcore.a @libcrypto_LIBS@
 
-TESTS = $(check_PROGRAMS)
+#TESTS = $(check_PROGRAMS)
 endif
 endif

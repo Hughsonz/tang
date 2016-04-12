@@ -3,6 +3,7 @@ before_install:
   - sudo sed -i 's|trusty|wily|g' /etc/apt/sources.list
   - sudo apt-get update -y
   - sudo apt-get remove -y 'postgres.*'
+  - sudo apt-get remove -y 'erlang.*' 'jdk.*' 'openjdk.*' 'ruby.*'
   - sudo apt-get -o Dpkg::Options::="--force-confnew" dist-upgrade -y
   - sudo apt-get -o Dpkg::Options::="--force-confnew" install -y libsystemd-dev libssl-dev libcryptsetup-dev automake autoconf make gcc clang
 before_script:

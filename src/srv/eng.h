@@ -1,6 +1,6 @@
 /* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
 /*
- * Copyright (c) 2015 Red Hat, Inc.
+ * Copyright (c) 2016 Red Hat, Inc.
  * Author: Nathaniel McCallum <npmccallum@redhat.com>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -18,39 +18,27 @@
  */
 
 #pragma once
+#include <jansson.h>
 #include <stdbool.h>
-#include <limits.h>
-
-#include "../asn1.h"
-#include "../list.h"
-
-#include <openssl/ec.h>
 
 typedef enum {
-    db_use_none = 0,
-    db_use_rec,
-    db_use_sig
-} db_use_t;
+    ENG_ERR_OK = 0,
+    ENG_ERR_KEY_NOT_FOUND,
+    ENG_ERR_BAD_REQUEST,
+    ENG_ERR_INTERNAL,
+    ENG_ERR_DENIED,
+} eng_err_t;
 
-typedef struct {
-    char path[PATH_MAX];
-    list_t keys;
-    int fd;
-} db_t;
+typedef struct eng {
+    const char *name;
 
-typedef struct {
-    char name[PATH_MAX];
-    list_t list;
-    EC_KEY *key;
-    db_use_t use;
-    bool adv;
-} db_key_t;
+    json_t *(*init)(const json_t *cfg, int *fd);
+    void (*event)(json_t *ctx, int fd);
 
-int
-db_open(const char *dbdir, db_t **db);
+    eng_err_t (*adv)(json_t *ctx, const char *kid, json_t **rep);
+    eng_err_t (*rec)(json_t *ctx, const char *bid,
+                     const json_t *req, json_t **rep);
 
-void
-db_free(db_t *db);
-
-int
-db_event(db_t *db);
+    bool (*add)(json_t *ctx, const char *bid);
+    bool (*del)(json_t *ctx, const char *bid);
+} eng_t;

@@ -1,16 +1,14 @@
 tangdir = $(localstatedir)/$(PACKAGE_NAME)
 
-AM_CFLAGS = @TANG_CFLAGS@ @libcrypto_CFLAGS@ -DTANG_DB=\"$(tangdir)\"
-LIBS = ../libcore.la
-
-bin_PROGRAMS = tang-key-gen
+AM_CFLAGS = @TANG_CFLAGS@ @jose_CFLAGS@
 
 systemdsystemunit_DATA = tang-keyd.socket tang-keyd.service
 EXTRA_DIST = tang-keyd.socket.in tang-keyd.service.in
 CLEANFILES = tang-keyd.socket tang-keyd.service
 
 libexec_PROGRAMS = tang-keyd
-tang_keyd_SOURCES = adv.c adv.h db.c db.h rec.c rec.h srv.c srv.h tang-keyd.c
+tang_keyd_SOURCES = eng.h eng_openssl.c tang-keyd.c
+tang_keyd_LDADD = @jose_LIBS@
 
 install-data-hook:
 	mkdir -p $(DESTDIR)$(tangdir)

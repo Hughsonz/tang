@@ -14,6 +14,7 @@ LT_INIT([disable-static])
 
 PKG_PROG_PKG_CONFIG([0.25])
 PKG_CHECK_MODULES([libcrypto], [libcrypto])
+PKG_CHECK_MODULES([jose], [jose])
 PKG_CHECK_MODULES([systemd], [systemd],
 		  [AC_SUBST([systemdsystemunitdir], [$($PKG_CONFIG --variable=systemdsystemunitdir systemd)])],
 		  [AC_SUBST([systemdsystemunitdir], [${prefix}/lib/systemd/system])])

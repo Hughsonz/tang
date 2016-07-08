@@ -39,7 +39,6 @@
 #define JSONRPC_CODE_INVALID_PARAMS -32702
 #define JSONRPC_CODE_INTERNAL_ERROR -32703
 #define TANG_CODE_PERMISSION_DENIED 5700
-#define TANG_CODE_KEY_NOT_FOUND 5701
 
 extern eng_t openssl;
 
@@ -70,7 +69,6 @@ static const struct {
     { JSONRPC_CODE_INVALID_PARAMS, "Invalid params" },
     { JSONRPC_CODE_INTERNAL_ERROR, "Internal error" },
     { TANG_CODE_PERMISSION_DENIED, "Permission denied" },
-    { TANG_CODE_KEY_NOT_FOUND, "Key not found" },
     {}
 };
 
@@ -138,7 +136,7 @@ make_error(json_int_t code, const json_t *id, pkt_t *pkt)
 static void
 handle(json_t *ctx, int fd)
 {
-    eng_err_t err = ENG_ERR_OK;
+    eng_err_t err = ENG_ERR_NONE;
     const char *paramid = NULL;
     const char *method = NULL;
     const char *jrpcv = NULL;
@@ -181,11 +179,7 @@ handle(json_t *ctx, int fd)
     }
 
     switch (err) {
-    case ENG_ERR_KEY_NOT_FOUND:
-        make_error(TANG_CODE_KEY_NOT_FOUND, id, &pkt);
-        break;
-
-    case ENG_ERR_BAD_REQUEST:
+    case ENG_ERR_BAD_REQ:
         make_error(JSONRPC_CODE_INVALID_PARAMS, id, &pkt);
         break;
 
@@ -193,7 +187,7 @@ handle(json_t *ctx, int fd)
         make_error(TANG_CODE_PERMISSION_DENIED, id, &pkt);
         break;
 
-    case ENG_ERR_OK:
+    case ENG_ERR_NONE:
         rep = json_pack("{s:s,s:O,s:o}", "jsonrpc", "2.0",
                         "id", id, "result", rep);
         memset(&pkt, 0, sizeof(pkt));

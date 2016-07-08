@@ -13,6 +13,8 @@ AM_PROG_CC_C_O
 LT_INIT([disable-static])
 
 PKG_PROG_PKG_CONFIG([0.25])
+AC_CHECK_HEADER([http_parser.h])
+AC_SEARCH_LIBS([http_parser_execute], [http_parser])
 PKG_CHECK_MODULES([libcrypto], [libcrypto])
 PKG_CHECK_MODULES([jose], [jose])
 PKG_CHECK_MODULES([systemd], [systemd],

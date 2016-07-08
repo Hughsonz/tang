@@ -37,6 +37,50 @@
 #include <string.h>
 #include <unistd.h>
 
+static const EVP_MD *
+get_md(const char *bid)
+{
+    const struct {
+        const char *prfx;
+        const EVP_MD *md;
+    } hashes[] = {
+        { "sha224:", EVP_sha224() },
+        { "sha256:", EVP_sha256() },
+        { "sha384:", EVP_sha384() },
+        { "sha512:", EVP_sha512() },
+        {}
+    };
+
+    for (size_t i = 0; hashes[i].prfx; i++) {
+        if (strncmp(bid, hashes[i].prfx, strlen(hashes[i].prfx)) == 0)
+            return hashes[i].md;
+    }
+
+    return NULL;
+}
+
+static bool
+bid_valid_syntax(const char *bid)
+{
+    const EVP_MD *md = NULL;
+    char *tmp = NULL;
+
+    md = get_md(bid);
+    if (!md)
+        return false;
+
+    tmp = strchr(bid, ':') + 1;
+    if (strlen(tmp) != (size_t) EVP_MD_size(md) * 2)
+        return false;
+
+    for (size_t i = 0; tmp[i]; i++) {
+        if (!isxdigit(tmp[i]))
+            return false;
+    }
+
+    return true;
+}
+
 static const char *
 make_blpath(json_t *ctx, const char *bid)
 {
@@ -59,11 +103,8 @@ make_blpath(json_t *ctx, const char *bid)
     if (strlen(fn) + strlen(bid) >= sizeof(fn))
         return NULL;
 
-    for (size_t i = 0; bid[i]; i++) {
-        if (!isalnum(bid[i]) && bid[i] != ':')
-            return NULL;
+    for (size_t i = 0; bid[i]; i++)
         off[i] = tolower(bid[i]);
-    }
 
     return fn;
 }
@@ -168,7 +209,7 @@ make_jws(json_t *ctx)
 
 /* Make the internal advertisment structure. This includes a default
  * advertisement JWS (signed with all public signing keys) and a lookup
- * JSON Object ("kid") containing JWSs signed with each private key. */
+ * JSON Object ("kid") containing JWSs signed with each key. */
 static json_t *
 make_adv(json_t *ctx)
 {
@@ -188,21 +229,25 @@ make_adv(json_t *ctx)
         const char *k = json_object_iter_key(i);
         json_t *v = json_object_iter_value(i);
         const char *kid = json_string_value(json_object_get(v, "kid"));
-
-        if (k[0] != '.')
-            continue;
+        json_t *sig = NULL;
 
         if (!jose_jwk_allowed(v, NULL, "sign"))
             continue;
+
+        if (k[0] != '.') {
+            json_object_set(json_object_get(adv, "kid"), kid,
+                            json_object_get(adv, "def"));
+            continue;
+        }
 
         jws = json_deep_copy(json_object_get(adv, "def"));
         if (!jws)
             continue;
 
-        if (!jose_jws_sign(jws, v, json_pack("{s:{s:O,s:s}}",
-                                             "protected", "kid",
-                                             json_object_get(v, "kid"),
-                                             "cty", "jwk-set+json"))) {
+        sig = json_pack("{s:{s:O,s:s}}", "protected",
+                        "kid", json_object_get(v, "kid"),
+                        "cty", "jwk-set+json");
+        if (!jose_jws_sign(jws, v, sig)) {
             json_decref(jws);
             continue;
         }
@@ -317,6 +362,42 @@ eng_event(json_t *ctx, int fd)
 }
 
 static eng_err_t
+eng_add(json_t *ctx, const char *bid)
+{
+    const char *blpath = NULL;
+    int fd = -1;
+
+    if (!bid_valid_syntax(bid))
+        return ENG_ERR_BAD_ID;
+
+    blpath = make_blpath(ctx, bid);
+    if (!blpath)
+        return ENG_ERR_INTERNAL;
+
+    fd = open(blpath, O_WRONLY | O_CREAT | O_EXCL);
+    if (fd < 0 && errno != EEXIST)
+        return ENG_ERR_INTERNAL;
+
+    close(fd);
+    return ENG_ERR_NONE;
+}
+
+static eng_err_t
+eng_del(json_t *ctx, const char *bid)
+{
+    const char *blpath = NULL;
+
+    if (!bid_valid_syntax(bid))
+        return ENG_ERR_BAD_ID;
+
+    blpath = make_blpath(ctx, bid);
+    if (!blpath)
+        return ENG_ERR_INTERNAL;
+
+    return unlink(blpath) == 0 ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
+}
+
+static eng_err_t
 eng_adv(json_t *ctx, const char *kid, json_t **rep)
 {
     json_t *adv = NULL;
@@ -327,17 +408,16 @@ eng_adv(json_t *ctx, const char *kid, json_t **rep)
     if (!adv)
         return ENG_ERR_INTERNAL;
 
-    if (kid)
+    if (kid) {
         *rep = json_object_get(json_object_get(adv, "kid"), kid);
+        if (!*rep)
+            return ENG_ERR_BAD_ID;
 
-    if (!*rep)
-        *rep = json_object_get(adv, "def");
+        *rep = json_incref(*rep);
+    } else
+        *rep = json_incref(json_object_get(adv, "def"));
 
-    *rep = json_incref(*rep);
-    if (!*rep)
-        return ENG_ERR_INTERNAL;
-
-    return ENG_ERR_OK;
+    return *rep ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
 }
 
 static EC_POINT *
@@ -410,19 +490,12 @@ hex2oct(const char *hex, uint8_t oct[])
 }
 
 static bool
-valid(const char *bid, const EC_GROUP *grp, const EC_POINT *p, BN_CTX *ctx)
+bid_valid(const char *bid, const EC_GROUP *grp, const EC_POINT *p, BN_CTX *ctx)
 {
     const EVP_MD *md = NULL;
 
-    if (strncmp(bid, "sha224:", strlen("sha224:")) == 0)
-        md = EVP_sha224();
-    else if (strncmp(bid, "sha256:", strlen("sha256:")) == 0)
-        md = EVP_sha256();
-    else if (strncmp(bid, "sha384:", strlen("sha384:")) == 0)
-        md = EVP_sha384();
-    else if (strncmp(bid, "sha512:", strlen("sha512:")) == 0)
-        md = EVP_sha512();
-    else
+    md = get_md(bid);
+    if (!md)
         return false;
 
     uint8_t enc[(EC_GROUP_get_degree(grp) + 7) * 8 * 2 + 1];
@@ -468,6 +541,8 @@ eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
     *rep = NULL;
 
     /* Check the blacklist. */
+    if (!bid_valid_syntax(bid))
+        return ENG_ERR_BAD_ID;
     blpath = make_blpath(ctx, bid);
     if (!blpath)
         return ENG_ERR_INTERNAL;
@@ -477,12 +552,12 @@ eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
     /* Load all the keys. */
     if (json_unpack((json_t *) req, "{s:s,s:s,s:s,s:o:s:o}",
                     "a", &ai, "b", &bi, "x", &x, "y", &y) == -1)
-        return ENG_ERR_BAD_REQUEST;
+        return ENG_ERR_BAD_REQ;
 
     a = find_key(ctx, ai);
     b = find_key(ctx, bi);
     if (!a || !b)
-        return ENG_ERR_KEY_NOT_FOUND;
+        return ENG_ERR_BAD_REQ;
 
     A = jose_openssl_jwk_to_EC_KEY(a);
     B = jose_openssl_jwk_to_EC_KEY(b);
@@ -497,7 +572,7 @@ eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
     if (EC_GROUP_cmp(grp, EC_KEY_get0_group(X), bnc) != 0 ||
         EC_GROUP_cmp(grp, EC_KEY_get0_group(Y), bnc) != 0 ||
         EC_GROUP_cmp(grp, EC_KEY_get0_group(B), bnc) != 0) {
-        ret = ENG_ERR_BAD_REQUEST;
+        ret = ENG_ERR_BAD_REQ;
         goto egress;
     }
 
@@ -508,8 +583,8 @@ eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
         goto egress;
 
     /* Validate the ID. */
-    if (!valid(bid, grp, p, bnc)) {
-        ret = ENG_ERR_BAD_REQUEST;
+    if (!bid_valid(bid, grp, p, bnc)) {
+        ret = ENG_ERR_BAD_REQ;
         goto egress;
     }
 
@@ -527,45 +602,15 @@ egress:
     EC_KEY_free(B);
     EC_KEY_free(X);
     EC_KEY_free(Y);
-    return *rep ? ENG_ERR_OK : ret;
-}
-
-static bool
-eng_add(json_t *ctx, const char *bid)
-{
-    const char *blpath = NULL;
-    int fd = -1;
-
-    blpath = make_blpath(ctx, bid);
-    if (!blpath)
-        return false;
-
-    fd = open(blpath, O_WRONLY | O_CREAT | O_EXCL);
-    if (fd < 0)
-        return errno == EEXIST;
-
-    close(fd);
-    return true;
-}
-
-static bool
-eng_del(json_t *ctx, const char *bid)
-{
-    const char *blpath = NULL;
-
-    blpath = make_blpath(ctx, bid);
-    if (!blpath)
-        return false;
-
-    return unlink(blpath) == 0;
+    return *rep ? ENG_ERR_NONE : ret;
 }
 
 const eng_t openssl = {
     "openssl",
     eng_init,
     eng_event,
+    eng_add,
+    eng_del,
     eng_adv,
     eng_rec,
-    eng_add,
-    eng_del
 };

@@ -22,10 +22,10 @@
 #include <stdbool.h>
 
 typedef enum {
-    ENG_ERR_OK = 0,
-    ENG_ERR_KEY_NOT_FOUND,
-    ENG_ERR_BAD_REQUEST,
+    ENG_ERR_NONE = 0,
     ENG_ERR_INTERNAL,
+    ENG_ERR_BAD_REQ,
+    ENG_ERR_BAD_ID,
     ENG_ERR_DENIED,
 } eng_err_t;
 
@@ -35,10 +35,9 @@ typedef struct eng {
     json_t *(*init)(const json_t *cfg, int *fd);
     void (*event)(json_t *ctx, int fd);
 
+    eng_err_t (*add)(json_t *ctx, const char *bid);
+    eng_err_t (*del)(json_t *ctx, const char *bid);
     eng_err_t (*adv)(json_t *ctx, const char *kid, json_t **rep);
     eng_err_t (*rec)(json_t *ctx, const char *bid,
                      const json_t *req, json_t **rep);
-
-    bool (*add)(json_t *ctx, const char *bid);
-    bool (*del)(json_t *ctx, const char *bid);
 } eng_t;

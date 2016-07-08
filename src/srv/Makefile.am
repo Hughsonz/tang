@@ -2,13 +2,15 @@ tangdir = $(localstatedir)/$(PACKAGE_NAME)
 
 AM_CFLAGS = @TANG_CFLAGS@ @jose_CFLAGS@
 
-systemdsystemunit_DATA = tang-keyd.socket tang-keyd.service
-EXTRA_DIST = tang-keyd.socket.in tang-keyd.service.in
-CLEANFILES = tang-keyd.socket tang-keyd.service
+systemdsystemunit_DATA = tang-jrpcd.socket tang-jrpcd.service
+EXTRA_DIST = tang-jrpcd.socket.in tang-jrpcd.service.in
+CLEANFILES = tang-jrpcd.socket tang-jrpcd.service
 
-libexec_PROGRAMS = tang-keyd
-tang_keyd_SOURCES = eng.h eng_openssl.c tang-keyd.c
-tang_keyd_LDADD = @jose_LIBS@
+libexec_PROGRAMS = tang-jrpcd tang-httpd
+tang_jrpcd_SOURCES = eng.h eng_openssl.c tang-jrpcd.c
+tang_jrpcd_LDADD = @jose_LIBS@
+tang_httpd_SOURCES = eng.h eng_openssl.c tang-httpd.c
+tang_httpd_LDADD = @jose_LIBS@
 
 install-data-hook:
 	mkdir -p $(DESTDIR)$(tangdir)

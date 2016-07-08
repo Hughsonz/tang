@@ -7,10 +7,13 @@ noinst_LTLIBRARIES = libclt.la
 libclt_la_SOURCES = adv.c adv.h rec.c rec.h msg.c msg.h sbuf.c sbuf.h
 libclt_la_LIBADD = ../libcore.la
 
+bin_PROGRAMS = tang
+tang_LDADD = @jose_LIBS@ -lhttp_parser
+
 nagiosdir = $(libdir)/nagios/plugins
-nagios_PROGRAMS = tang
-tang_SOURCES = nagios.c
-tang_LDADD = libclt.la
+nagios_PROGRAMS = tang-nagios
+tang_nagios_SOURCES = nagios.c
+tang_nagios_LDADD = libclt.la
 
 if USE_CLEVIS
 clevispin_LTLIBRARIES = tang.la

@@ -235,7 +235,7 @@ egress:
     dprintf(req->fd, "Content-Length: %zu\r\n", enc ? strlen(enc) : 0);
 
     if (req->err == 200 && ct)
-        dprintf(req->fd, "Content-Type: %s\r\n\r\n", ct);
+        dprintf(req->fd, "Content-Type: %s\r\n", ct);
 
     dprintf(req->fd, "\r\n");
 

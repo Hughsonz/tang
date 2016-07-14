@@ -36,7 +36,7 @@
 #define LISTEN_FD_START 3
 #define NEVTS 5
 
-extern eng_t openssl;
+extern eng_t jose;
 
 typedef struct {
     char data[32 * 1024];
@@ -180,15 +180,15 @@ on_message_complete(http_parser *parser)
 
     switch (parser->method) {
     case HTTP_DELETE:
-        err = openssl.del(req->ctx, id);
+        err = jose.del(req->ctx, id);
         break;
 
     case HTTP_PUT:
-        err = openssl.add(req->ctx, id);
+        err = jose.add(req->ctx, id);
         break;
 
     case HTTP_GET:
-        err = openssl.adv(req->ctx, id, &jrep);
+        err = jose.adv(req->ctx, id, &jrep);
         ct = "application/jose+json";
         break;
 
@@ -199,7 +199,7 @@ on_message_complete(http_parser *parser)
             goto egress;
         }
 
-        err = openssl.rec(req->ctx, id, jreq, &jrep);
+        err = jose.rec(req->ctx, id, jreq, &jrep);
         ct = "application/jwk+json";
         break;
 
@@ -276,7 +276,7 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
 
     if (argc != 3 ||
-        strcmp(argv[1], "openssl") != 0 ||
+        strcmp(argv[1], "jose") != 0 ||
         !(cfg = json_loads(argv[2], 0, NULL))) {
         fprintf(stderr, "Usage: %s <ENGINE> <CONFIG>\n", argv[0]);
         return EXIT_FAILURE;
@@ -294,7 +294,7 @@ main(int argc, char *argv[])
     if (epoll < 0)
         goto egress;
 
-    ctx = openssl.init(cfg, &engfd);
+    ctx = jose.init(cfg, &engfd);
     if (!ctx)
         goto egress;
 
@@ -331,7 +331,7 @@ main(int argc, char *argv[])
     for (int nevts; (nevts = epoll_wait(epoll, evts, NEVTS, -1)) > 0; ) {
         for (int i = 0; i < nevts; i++) {
             if (evts[i].data.fd == engfd) {
-                openssl.event(ctx, engfd);
+                jose.event(ctx, engfd);
                 continue;
             }
 

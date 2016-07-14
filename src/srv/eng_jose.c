@@ -157,7 +157,7 @@ make_jwkset(json_t *ctx)
         if (!c)
             continue;
 
-        if (!jose_jwk_clean(c, JOSE_JWK_TYPE_ALL)) {
+        if (!jose_jwk_clean(c)) {
             json_decref(c);
             continue;
         }
@@ -605,8 +605,8 @@ egress:
     return *rep ? ENG_ERR_NONE : ret;
 }
 
-const eng_t openssl = {
-    "openssl",
+const eng_t jose = {
+    "jose",
     eng_init,
     eng_event,
     eng_add,

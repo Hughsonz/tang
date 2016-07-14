@@ -1,9 +1,10 @@
 [Unit]
-Description=Tang key daemon socket
+Description=Tang daemon socket
 ConditionDirectoryNotEmpty=@TANG_DB@
 
 [Socket]
-ListenDatagram=@TANG_PORT@
+ListenStream=@TANG_PORT@
+Accept=true
 
 [Install]
 WantedBy=multi-user.target

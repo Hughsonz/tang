@@ -39,9 +39,11 @@
 
 /**
  * The ctx structure looks like this: {
- *   "inotify": { <path>: [ <attr(string)>, <wd(integer)> ] },
+ *   "inotify": { <attr>: [ <path(string)>, <wd(integer)> ], ... },
+ *
  *   "database": { <path>: [ <jwk(object)>, ... ] },
  *   "blacklist": { <hash:thumbprint>: true, ... },
+ *
  *   "adv": {
  *     "default": <adv(string)>,
  *     <hash:thumbprint>: <adv(string)>,
@@ -81,75 +83,50 @@ static const char *hashes[] = {
     NULL
 };
 
-static const EVP_MD *
-get_md(const char *bid)
-{
-    const struct {
-        const char *prfx;
-        const EVP_MD *md;
-    } hashes[] = {
-        { "sha224:", EVP_sha224() },
-        { "sha256:", EVP_sha256() },
-        { "sha384:", EVP_sha384() },
-        { "sha512:", EVP_sha512() },
-        {}
-    };
-
-    for (size_t i = 0; hashes[i].prfx; i++) {
-        if (strncmp(bid, hashes[i].prfx, strlen(hashes[i].prfx)) == 0)
-            return hashes[i].md;
-    }
-
-    return NULL;
-}
-
 static bool
-bid_valid_syntax(const char *bid)
+ktp_valid_syntax(const char *ktp)
 {
-    const EVP_MD *md = NULL;
-    char *tmp = NULL;
+    for (size_t i = 0; hashes[i]; i++) {
+        size_t tlen = jose_jwk_thumbprint_len(hashes[i]);
+        size_t hlen = strlen(hashes[i]);
 
-    md = get_md(bid);
-    if (!md)
-        return false;
+        if (strncmp(hashes[i], ktp, hlen) != 0)
+            continue;
 
-    tmp = strchr(bid, ':') + 1;
-    if (strlen(tmp) != (size_t) EVP_MD_size(md) * 2)
-        return false;
+        if (ktp[hlen++] != ':')
+            continue;
 
-    for (size_t i = 0; tmp[i]; i++) {
-        if (!isxdigit(tmp[i]))
-            return false;
+        if (strlen(ktp) != hlen + tlen)
+            continue;
+
+        uint8_t thp[tlen];
+
+        if (jose_b64_decode_buf(&ktp[hlen], thp))
+            return true;
     }
 
-    return true;
+    return false;
 }
 
 static const char *
-make_blpath(json_t *ctx, const char *bid)
+make_blpath(json_t *ctx, const char *ktp)
 {
     static char fn[PATH_MAX] = {};
-    const char *bl = NULL;
-    char *off = NULL;
+    const char *dir = NULL;
+    int wd = -1;
 
     memset(fn, 0, sizeof(fn));
 
-    if (json_unpack(ctx, "{s:s}", "bl", &bl) == -1)
+    if (json_unpack(ctx, "{s:{s:[si!]}}",
+                    "inotify", "blacklist", &dir, &wd) == -1)
         return NULL;
 
-    if (strlen(bl) >= sizeof(fn) - 1)
+    if (strlen(dir) + strlen(ktp) + 2 > sizeof(fn))
         return NULL;
 
-    strcpy(fn, bl);
+    strcpy(fn, dir);
     strcat(fn, "/");
-    off = &fn[strlen(fn)];
-
-    if (strlen(fn) + strlen(bid) >= sizeof(fn))
-        return NULL;
-
-    for (size_t i = 0; bid[i]; i++)
-        off[i] = tolower(bid[i]);
-
+    strcat(fn, ktp);
     return fn;
 }
 
@@ -158,14 +135,33 @@ static json_t *
 load_jwks(const char *db, const char *name)
 {
     char fn[PATH_MAX] = {};
+    json_t *jwkset = NULL;
     json_t *jwk = NULL;
+    json_t *arr = NULL;
+    size_t i = 0;
 
+#warning TODO
     snprintf(fn, sizeof(fn) - 1, "%s/%s", db, name);
 
-    jwk = json_load_file(fn, 0, NULL);
-    if (!jwk) {
-        fprintf(stderr, "Error loading JWK: %s!\n", fn);
+    jwkset = json_load_file(fn, 0, NULL);
+    if (!jwkset) {
+        fprintf(stderr, "Error loading JWK(Set): %s!\n", fn);
         return NULL;
+    }
+
+    arr = json_incref(json_object_get(jwkset, "keys"));
+    if (!json_is_array(arr))
+        arr = json_pack("[o]", "keys", jwkset);
+
+    json_array_foreach(arr, i, jwk) {
+        if (json_unpack(jwk, "{s?s,s?s}", "kty", &kty, "use", &use) == -1)
+            goto error;
+
+        if (!kty || strcmp(kty, "EC") != 0)
+            goto error;
+
+        if (!use || 
+
     }
 
     if (json_unpack_ex(jwk, NULL, JSON_VALIDATE_ONLY,
@@ -397,8 +393,8 @@ eng_init(const json_t *cfg, int *fd)
         goto error;
 
     ctx = json_pack("{s:{s:[s,i],s:[s,i]},s:{},s:{}}", "inotify",
-                    db, "database", dbwd,
-                    bl, "blacklist", blwd,
+                    "database", db, dbwd,
+                    "blacklist", bl, blwd,
                     "database", "blacklist");
     if (!ctx)
         goto error;
@@ -467,25 +463,25 @@ eng_event(json_t *ctx, int fd)
             continue;
 
         json_object_foreach(json_object_get(ctx, "inotify"), key, val) {
-            const char *attr = NULL;
+            const char *dir = NULL;
             json_t *obj = NULL;
             int wd = -1;
 
-            if (json_unpack(val, "[s,i!]", &attr, &wd) == -1)
+            if (json_unpack(val, "[s,i!]", &dir, &wd) == -1)
                 continue;
 
             if (ev->wd != wd)
                 continue;
 
-            obj = json_object_get(ctx, attr);
+            obj = json_object_get(ctx, key);
             json_object_del(obj, ev->name);
 
             if ((ev->mask & (IN_MOVED_TO | IN_CLOSE_WRITE | IN_CREATE)) == 0)
                 continue;
 
-            if (strcmp(attr, "database") == 0)
-                json_object_set_new(obj, ev->name, load_jwks(key, ev->name));
-            else if (strcmp(attr, "blacklist") == 0)
+            if (strcmp(key, "database") == 0)
+                json_object_set_new(obj, ev->name, load_jwks(dir, ev->name));
+            else if (strcmp(key, "blacklist") == 0)
                 json_object_set_new(obj, ev->name, json_true());
         }
     }
@@ -497,17 +493,17 @@ eng_event(json_t *ctx, int fd)
 static eng_err_t
 eng_add(json_t *ctx, const char *ktp)
 {
-    const char *blpath = NULL;
+    const char *blp = NULL;
     int fd = -1;
 
-    if (!bid_valid_syntax(bid))
+    if (!ktp_valid_syntax(ktp))
         return ENG_ERR_BAD_ID;
 
-    blpath = make_blpath(ctx, bid);
-    if (!blpath)
+    blp = make_blpath(ctx, ktp);
+    if (!blp)
         return ENG_ERR_INTERNAL;
 
-    fd = open(blpath, O_WRONLY | O_CREAT | O_EXCL);
+    fd = open(blp, O_WRONLY | O_CREAT | O_EXCL);
     if (fd < 0 && errno != EEXIST)
         return ENG_ERR_INTERNAL;
 
@@ -518,22 +514,25 @@ eng_add(json_t *ctx, const char *ktp)
 static eng_err_t
 eng_del(json_t *ctx, const char *ktp)
 {
-    const char *blpath = NULL;
+    const char *blp = NULL;
 
-    if (!bid_valid_syntax(bid))
+    if (!ktp_valid_syntax(ktp))
         return ENG_ERR_BAD_ID;
 
-    blpath = make_blpath(ctx, bid);
-    if (!blpath)
+    blp = make_blpath(ctx, ktp);
+    if (!blp)
         return ENG_ERR_INTERNAL;
 
-    return unlink(blpath) == 0 ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
+    return unlink(blp) == 0 ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
 }
 
 static eng_err_t
 eng_adv(json_t *ctx, const char *ktp, const char **o)
 {
     int r = 0;
+
+    if (!ktp_valid_syntax(ktp))
+        return ENG_ERR_BAD_ID;
 
     r = json_unpack(ctx, "{s:{s:s}}", "adv", ktp ? ktp : "default", o);
     return r == 0 ? ENG_ERR_NONE : ktp ? ENG_ERR_BAD_ID : ENG_ERR_INTERNAL;
@@ -639,7 +638,7 @@ bid_valid(const char *bid, const EC_GROUP *grp, const EC_POINT *p, BN_CTX *ctx)
 }
 
 static eng_err_t
-eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
+eng_rec(json_t *ctx, const char *ktp, const json_t *req, json_t **rep)
 {
     eng_err_t ret = ENG_ERR_INTERNAL;
     const EC_GROUP *grp = NULL;
@@ -660,7 +659,7 @@ eng_rec(json_t *ctx, const char *bid, const json_t *req, json_t **rep)
     *rep = NULL;
 
     /* Check the blacklist. */
-    if (!bid_valid_syntax(bid))
+    if (!ktp_valid_syntax(ktp))
         return ENG_ERR_BAD_ID;
     blpath = make_blpath(ctx, bid);
     if (!blpath)

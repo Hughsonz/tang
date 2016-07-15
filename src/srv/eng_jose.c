@@ -37,6 +37,50 @@
 #include <string.h>
 #include <unistd.h>
 
+/**
+ * The ctx structure looks like this: {
+ *   "inotify": { <path>: [ <attr(string)>, <wd(integer)> ] },
+ *   "database": { <path>: [ <jwk(object)>, ... ] },
+ *   "blacklist": { <hash:thumbprint>: true, ... },
+ *   "adv": {
+ *     "default": <adv(string)>,
+ *     <hash:thumbprint>: <adv(string)>,
+ *     ...
+ *   },
+ *   "rec": {
+ *     <hash:thumbprint>: <jwk(object)>,
+ *     ...
+ *   }
+ * }
+ *
+ * We setup two inotify watches (key database directory and blacklist
+ * directory) into the "inotify" section of the tree. The on-disk state is
+ * synchronized into the "database" and "blacklist" structures of the tree.
+ * This allows us to avoid disk IO at request time.
+ *
+ * After any changes to the "database" section, the "adv" and "rec" sections
+ * are destroyed and recreated.
+ *
+ * The "adv" section contains all of the possible signing options. The
+ * signatures are pre-computed and pre-marshalled. This means that when an
+ * advtertisement request is received, the only thing we need to do is hand
+ * off the appropriate pre-marshalled buffer.
+ *
+ * Similarly, the "rec" section contains a pre-computed table for looking up
+ * JWKs using their thumbprints. These are then used for the cryptographic
+ * operation.
+ */
+
+#define IN_FLAGS (IN_DELETE | IN_MOVE | IN_CLOSE_WRITE | IN_CREATE)
+
+static const char *hashes[] = {
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    NULL
+};
+
 static const EVP_MD *
 get_md(const char *bid)
 {
@@ -111,7 +155,7 @@ make_blpath(json_t *ctx, const char *bid)
 
 /* Load a JWK from the specified file. Ensure required properties. */
 static json_t *
-load_jwk(const char *db, const char *name)
+load_jwks(const char *db, const char *name)
 {
     char fn[PATH_MAX] = {};
     json_t *jwk = NULL;
@@ -134,46 +178,55 @@ load_jwk(const char *db, const char *name)
     return jwk;
 }
 
-/* Make the JWKSet for the advertisement. Include all public keys. */
 static json_t *
 make_jwkset(json_t *ctx)
 {
+    const char *key = NULL;
     json_t *jwkset = NULL;
+    json_t *val = NULL;
 
-    jwkset = json_pack("{s:[]}", "keys");
+    jwkset = json_pack("{s:[],s:[]}", "keys", "hashes");
     if (!jwkset)
         return NULL;
 
-    for (void *i = json_object_iter(json_object_get(ctx, "keys")); i;
-               i = json_object_iter_next(json_object_get(ctx, "keys"), i)) {
-        const char *k = json_object_iter_key(i);
-        json_t *v = json_object_iter_value(i);
-        json_t *c = NULL;
+    json_object_foreach(json_object_get(ctx, "database"), key, val) {
+        json_t *jwk = NULL;
+        size_t i = 0;
 
-        if (k[0] == '.')
+        if (key[0] == '.')
             continue;
 
-        c = json_deep_copy(v);
-        if (!c)
-            continue;
+        json_array_foreach(val, i, jwk) {
+            json_t *cpy = NULL;
 
-        if (!jose_jwk_clean(c)) {
-            json_decref(c);
-            continue;
+            cpy = json_deep_copy(jwk);
+            if (!cpy)
+                continue;
+
+            if (!jose_jwk_clean(cpy)) {
+                json_decref(cpy);
+                continue;
+            }
+
+            json_array_append_new(json_object_get(jwkset, "keys"), cpy);
         }
+    }
 
-        json_array_append_new(json_object_get(jwkset, "keys"), c);
+    for (size_t i = 0; hashes[i]; i++) {
+        json_array_append_new(json_object_get(jwkset, "hashes"),
+                              json_string(hashes[i]));
     }
 
     return jwkset;
 }
 
-/* Make the JWS for the advertisment. Sign with all public signing keys. */
 static json_t *
 make_jws(json_t *ctx)
 {
+    const char *key = NULL;
     json_t *jwkset = NULL;
     json_t *jws = NULL;
+    json_t *val = NULL;
 
     jwkset = make_jwkset(ctx);
     if (!jwkset)
@@ -184,97 +237,136 @@ make_jws(json_t *ctx)
     if (!jws)
         return NULL;
 
-    for (void *i = json_object_iter(json_object_get(ctx, "keys")); i;
-               i = json_object_iter_next(json_object_get(ctx, "keys"), i)) {
-        const char *k = json_object_iter_key(i);
-        json_t *v = json_object_iter_value(i);
+    json_object_foreach(json_object_get(ctx, "database"), key, val) {
+        json_t *jwk = NULL;
+        size_t i = 0;
 
-        if (k[0] == '.')
+        if (key[0] == '.')
             continue;
 
-        if (!jose_jwk_allowed(v, NULL, "sign"))
-            continue;
+        json_array_foreach(val, i, jwk) {
+            if (!jose_jwk_allowed(jwk, NULL, "sign"))
+                continue;
 
-        fprintf(stderr, "Signing with: %s\n", k);
-
-        if (!jose_jws_sign(jws, v, json_pack("{s:{s:O,s:s}}",
-                                             "protected", "kid",
-                                             json_object_get(v, "kid"),
-                                             "cty", "jwk-set+json")))
-            fprintf(stderr, "Signing failed for %s!\n", k);
+            if (!jose_jws_sign(jws, jwk, json_pack("{s:{s:s}}", "protected",
+                                                   "cty", "jwk-set+json")))
+                fprintf(stderr, "Signing failed for %s!\n", key);
+        }
     }
 
     return jws;
 }
 
-/* Make the internal advertisment structure. This includes a default
- * advertisement JWS (signed with all public signing keys) and a lookup
- * JSON Object ("kid") containing JWSs signed with each key. */
 static json_t *
 make_adv(json_t *ctx)
 {
+    const char *key = NULL;
+    json_t *val = NULL;
     json_t *jws = NULL;
     json_t *adv = NULL;
+    char *pub = NULL;
 
     jws = make_jws(ctx);
     if (!jws)
         return NULL;
 
-    adv = json_pack("{s:o,s:{}}", "def", jws, "kid");
+    pub = json_dumps(jws, JSON_SORT_KEYS | JSON_COMPACT);
+    json_decref(jws);
+    if (!pub)
+        return NULL;
+
+    jws = json_string(pub);
+    free(pub);
+    if (!jws)
+        return NULL;
+
+    adv = json_pack("{s:o}", "default", jws);
     if (!adv)
         return NULL;
 
-    for (void *i = json_object_iter(json_object_get(ctx, "keys")); i;
-               i = json_object_iter_next(json_object_get(ctx, "keys"), i)) {
-        const char *k = json_object_iter_key(i);
-        json_t *v = json_object_iter_value(i);
-        const char *kid = json_string_value(json_object_get(v, "kid"));
-        json_t *sig = NULL;
+    json_object_foreach(json_object_get(ctx, "database"), key, val) {
+        json_t *jwk = NULL;
+        size_t i = 0;
 
-        if (!jose_jwk_allowed(v, NULL, "sign"))
-            continue;
+        json_array_foreach(val, i, jwk) {
+            json_t *sig = NULL;
+            char *prv = NULL;
 
-        if (k[0] != '.') {
-            json_object_set(json_object_get(adv, "kid"), kid,
-                            json_object_get(adv, "def"));
-            continue;
+            sig = json_deep_copy(jws);
+            if (!sig)
+                continue;
+
+            if (!jose_jws_sign(sig, jwk, json_pack("{s:{s:s}}", "protected",
+                                                   "cty", "jwk-set+json"))) {
+                json_decref(sig);
+                continue;
+            }
+
+            prv = json_dumps(sig, JSON_SORT_KEYS | JSON_COMPACT);
+            json_decref(sig);
+            if (!prv)
+                continue;
+
+            sig = json_string(prv);
+            free(prv);
+            if (!sig)
+                continue;
+
+            for (size_t j = 0; hashes[j]; j++) {
+                size_t len = 0;
+
+                len = jose_jwk_thumbprint_len(hashes[i]);
+                if (len == 0)
+                    continue;
+
+                char tp[strlen(hashes[i]) + len + 2];
+
+                strcpy(tp, hashes[i]);
+                strcat(tp, ":");
+                if (jose_jwk_thumbprint_buf(jwk, hashes[i], &tp[strlen(tp)]))
+                    json_object_set(adv, tp, key[0] == '.' ? sig : jws);
+            }
+
+            json_decref(sig);
         }
-
-        jws = json_deep_copy(json_object_get(adv, "def"));
-        if (!jws)
-            continue;
-
-        sig = json_pack("{s:{s:O,s:s}}", "protected",
-                        "kid", json_object_get(v, "kid"),
-                        "cty", "jwk-set+json");
-        if (!jose_jws_sign(jws, v, sig)) {
-            json_decref(jws);
-            continue;
-        }
-
-        json_object_set_new(json_object_get(adv, "kid"), kid, jws);
     }
 
     return adv;
 }
 
-/* Find a key from the key identifier. */
-static const json_t *
-find_key(json_t *ctx, const char *kid)
+static json_t *
+make_rec(const json_t *ctx)
 {
-    for (void *i = json_object_iter(json_object_get(ctx, "keys")); i;
-               i = json_object_iter_next(json_object_get(ctx, "keys"), i)) {
-        json_t *v = json_object_iter_value(i);
-        const char *id = NULL;
+    const char *key = NULL;
+    json_t *rec = NULL;
+    json_t *val = NULL;
+    json_t *jwk = NULL;
+    size_t i = 0;
 
-        if (json_unpack(v, "{s:s}", "kid", &id) == -1)
-            continue;
+    rec = json_object();
+    if (!rec)
+        return NULL;
 
-        if (strcmp(kid, id) == 0)
-            return v;
+    json_object_foreach(json_object_get(ctx, "database"), key, val) {
+        json_array_foreach(val, i, jwk) {
+            for (size_t j = 0; hashes[j]; j++) {
+                size_t len = 0;
+
+                len = jose_jwk_thumbprint_len(hashes[i]);
+                if (len == 0)
+                    continue;
+
+                char thp[strlen(hashes[i]) + len + 2];
+
+                strcpy(thp, hashes[i]);
+                strcat(thp, ":");
+                if (jose_jwk_thumbprint_buf(jwk, hashes[i], &thp[strlen(thp)]))
+                    json_object_set(rec, thp, jwk);
+            }
+        }
     }
 
-    return NULL;
+    return rec;
 }
 
 static json_t *
@@ -284,6 +376,8 @@ eng_init(const json_t *cfg, int *fd)
     const char *bl = NULL;
     json_t *ctx = NULL;
     DIR *dir = NULL;
+    int dbwd = 0;
+    int blwd = 0;
 
     if (json_unpack((json_t *) cfg, "{s:s,s:s}",
                     "database", &db, "blacklist", &bl) == -1)
@@ -293,11 +387,19 @@ eng_init(const json_t *cfg, int *fd)
     if (*fd < 0)
         return NULL;
 
-    if (inotify_add_watch(*fd, db, IN_DELETE | IN_MOVE | IN_CLOSE_WRITE) < 0)
+
+    dbwd = inotify_add_watch(*fd, db, IN_FLAGS);
+    if (dbwd < 0)
         goto error;
 
-    ctx = json_pack("{s:s,s:s,s:{},s:{s:{},s:{}}}",
-                    "db", db, "bl", bl, "keys", "adv", "def", "kid");
+    blwd = inotify_add_watch(*fd, bl, IN_FLAGS);
+    if (blwd < 0)
+        goto error;
+
+    ctx = json_pack("{s:{s:[s,i],s:[s,i]},s:{},s:{}}", "inotify",
+                    db, "database", dbwd,
+                    bl, "blacklist", blwd,
+                    "database", "blacklist");
     if (!ctx)
         goto error;
 
@@ -309,12 +411,29 @@ eng_init(const json_t *cfg, int *fd)
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
             continue;
 
-        if (json_object_set_new(json_object_get(ctx, "keys"), de->d_name,
-                                load_jwk(db, de->d_name)) == -1)
+        if (json_object_set_new(json_object_get(ctx, "database"), de->d_name,
+                                load_jwks(db, de->d_name)) == -1)
+            goto error;
+    }
+
+    closedir(dir);
+    dir = opendir(bl);
+    if (!dir)
+        goto error;
+
+    for (struct dirent *de = readdir(dir); de; de = readdir(dir)) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+
+        if (json_object_set_new(json_object_get(ctx, "blacklist"),
+                                de->d_name, json_true()) == -1)
             goto error;
     }
 
     if (json_object_set_new(ctx, "adv", make_adv(ctx)) == -1)
+        goto error;
+
+    if (json_object_set_new(ctx, "rec", make_rec(ctx)) == -1)
         goto error;
 
     closedir(dir);
@@ -332,37 +451,51 @@ eng_event(json_t *ctx, int fd)
 {
     unsigned char buf[(sizeof(struct inotify_event) + NAME_MAX + 1) * 20] = {};
     const struct inotify_event *ev;
-    const char *db = NULL;
-    json_t *keys = NULL;
     ssize_t bytes = 0;
-
-    if (json_unpack(ctx, "{s:o,s:s}", "keys", &keys, "db", &db) == -1)
-        return;
 
     bytes = read(fd, buf, sizeof(buf));
     if (bytes < 0)
         return;
 
     for (ssize_t i = 0; i < bytes; i += sizeof(*ev) + ev->len) {
+        const char *key = NULL;
+        json_t *val = NULL;
+
         ev = (struct inotify_event *) &buf[i];
 
         if (ev->len == 0)
             continue;
 
-        json_object_del(keys, ev->name);
+        json_object_foreach(json_object_get(ctx, "inotify"), key, val) {
+            const char *attr = NULL;
+            json_t *obj = NULL;
+            int wd = -1;
 
-        if (ev->mask & (IN_MOVED_TO | IN_CLOSE_WRITE)) {
-            if (json_object_set_new(keys, ev->name,
-                                    load_jwk(db, ev->name)) == -1)
+            if (json_unpack(val, "[s,i!]", &attr, &wd) == -1)
                 continue;
+
+            if (ev->wd != wd)
+                continue;
+
+            obj = json_object_get(ctx, attr);
+            json_object_del(obj, ev->name);
+
+            if ((ev->mask & (IN_MOVED_TO | IN_CLOSE_WRITE | IN_CREATE)) == 0)
+                continue;
+
+            if (strcmp(attr, "database") == 0)
+                json_object_set_new(obj, ev->name, load_jwks(key, ev->name));
+            else if (strcmp(attr, "blacklist") == 0)
+                json_object_set_new(obj, ev->name, json_true());
         }
     }
 
     json_object_set_new(ctx, "adv", make_adv(ctx));
+    json_object_set_new(ctx, "rec", make_rec(ctx));
 }
 
 static eng_err_t
-eng_add(json_t *ctx, const char *bid)
+eng_add(json_t *ctx, const char *ktp)
 {
     const char *blpath = NULL;
     int fd = -1;
@@ -383,7 +516,7 @@ eng_add(json_t *ctx, const char *bid)
 }
 
 static eng_err_t
-eng_del(json_t *ctx, const char *bid)
+eng_del(json_t *ctx, const char *ktp)
 {
     const char *blpath = NULL;
 
@@ -398,26 +531,12 @@ eng_del(json_t *ctx, const char *bid)
 }
 
 static eng_err_t
-eng_adv(json_t *ctx, const char *kid, json_t **rep)
+eng_adv(json_t *ctx, const char *ktp, const char **o)
 {
-    json_t *adv = NULL;
+    int r = 0;
 
-    *rep = NULL;
-
-    adv = json_object_get(ctx, "adv");
-    if (!adv)
-        return ENG_ERR_INTERNAL;
-
-    if (kid) {
-        *rep = json_object_get(json_object_get(adv, "kid"), kid);
-        if (!*rep)
-            return ENG_ERR_BAD_ID;
-
-        *rep = json_incref(*rep);
-    } else
-        *rep = json_incref(json_object_get(adv, "def"));
-
-    return *rep ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
+    r = json_unpack(ctx, "{s:{s:s}}", "adv", ktp ? ktp : "default", o);
+    return r == 0 ? ENG_ERR_NONE : ktp ? ENG_ERR_BAD_ID : ENG_ERR_INTERNAL;
 }
 
 static EC_POINT *

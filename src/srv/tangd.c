@@ -20,15 +20,14 @@
 #include "eng.h"
 #include "http_parser.h"
 
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-
+#include <sys/types.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
 #include <signal.h>
 #include <string.h>
+#include <regex.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -47,7 +46,7 @@ typedef struct {
     json_t *ctx;
     int fd;
     int err;
-    char *url;
+    char url[4096];
     char *body;
     size_t blen;
 } req_t;
@@ -102,27 +101,16 @@ static int
 on_url(http_parser *parser, const char *at, size_t length)
 {
     req_t *req = parser->data;
-    char *tmp = NULL;
-    size_t len = 0;
 
     if (req->err != 0)
         return 0;
 
-    len = req->url ? strlen(req->url) : 0;
-
-    if (req->url && len + length + 1 > 8 * 1024) {
+    if (strlen(req->url) + length >= sizeof(req->url)) {
         req->err = 414;
         return 0;
     }
 
-    tmp = realloc(req->url, len + length + 1);
-    if (!tmp)
-        return ENOMEM;
-
-    memcpy(&tmp[len], at, length);
-    tmp[len + length] = 0;
-
-    req->url = tmp;
+    strncat(req->url, at, length);
     return 0;
 }
 
@@ -151,77 +139,116 @@ on_body(http_parser *parser, const char *at, size_t length)
     return 0;
 }
 
+static eng_err_t
+rec(req_t *r, enum http_method h, regmatch_t *m, const char **ct, json_t **rep)
+{
+    char id[sizeof(r->url)] = {};
+    eng_err_t err = ENG_ERR_NONE;
+    json_t *req = NULL;
+
+    if (m[1].rm_so < m[1].rm_eo)
+        strncpy(id, &r->url[m[1].rm_so], m[1].rm_eo - m[1].rm_so);
+
+    switch (h) {
+    case HTTP_DELETE: return jose.del(r->ctx, id);
+    case HTTP_PUT: return jose.add(r->ctx, id);
+    case HTTP_POST: break;
+    default: return ENG_ERR_BAD_REQ;
+    }
+
+    req = json_loadb(r->body, r->blen, 0, NULL);
+    if (!req)
+        return ENG_ERR_BAD_REQ;
+
+    *ct = "application/jwk+json";
+    err = jose.rec(r->ctx, req, rep);
+    json_decref(req);
+    return err;
+}
+
+static eng_err_t
+adv(req_t *r, enum http_method h, regmatch_t *m, const char **ct, json_t **rep)
+{
+    *ct = "application/jose+json";
+
+    if (m[1].rm_so < m[1].rm_eo) {
+        char id[sizeof(r->url)] = {};
+        strncpy(id, &r->url[m[1].rm_so], m[1].rm_eo - m[1].rm_so);
+        return jose.adv(r->ctx, id, rep);
+    }
+
+    return jose.adv(r->ctx, NULL, rep);
+}
+
+static const struct {
+    const char *re;
+    eng_err_t
+    (*func)(req_t *, enum http_method, regmatch_t *,
+            const char **ct, json_t **);
+    uint64_t methods;
+} funcs[] = {
+    { "^/+rec/+([0-9A-Za-z_-]+)?$", rec,
+      (1 << HTTP_DELETE) | (1 << HTTP_PUT) | (1 << HTTP_POST) },
+    { "^/+rec$", rec,
+      (1 << HTTP_DELETE) | (1 << HTTP_PUT) | (1 << HTTP_POST) },
+    { "^/+adv/+([0-9A-Za-z_-]+)?$", adv, (1 << HTTP_GET) },
+    { "^/+adv$", adv, (1 << HTTP_GET) },
+    {}
+};
+
 static int
 on_message_complete(http_parser *parser)
 {
-    eng_err_t err = ENG_ERR_NONE;
     req_t *req = parser->data;
     const char *msg = NULL;
     const char *ct = NULL;
-    const char *id = NULL;
-    json_t *jreq = NULL;
-    json_t *jrep = NULL;
     char *enc = NULL;
 
     if (req->err != 0)
         goto egress;
 
-    if (!req->url || req->url[0] != '/') {
-        req->err = 400;
-        goto egress;
-    }
+    req->err = 404;
 
-    if (!req->url || strrchr(req->url, '/') != req->url) {
-        req->err = 404;
-        goto egress;
-    }
+    for (size_t i = 0; funcs[i].func; i++) {
+        eng_err_t err = ENG_ERR_NONE;
+        regmatch_t m[3] = {};
+        json_t *rep = NULL;
+        regex_t re = {};
 
-    id = strcmp(req->url, "/") == 0 ? NULL : &req->url[1];
-
-    switch (parser->method) {
-    case HTTP_DELETE:
-        err = jose.del(req->ctx, id);
-        break;
-
-    case HTTP_PUT:
-        err = jose.add(req->ctx, id);
-        break;
-
-    case HTTP_GET:
-        err = jose.adv(req->ctx, id, &jrep);
-        ct = "application/jose+json";
-        break;
-
-    case HTTP_POST:
-        jreq = json_loadb(req->body, req->blen, 0, NULL);
-        if (!jreq) {
-            req->err = 400;
-            goto egress;
-        }
-
-        err = jose.rec(req->ctx, id, jreq, &jrep);
-        ct = "application/jwk+json";
-        break;
-
-    default:
-        req->err = 405;
-        goto egress;
-    }
-
-    if (req->err == ENG_ERR_NONE && jrep) {
-        enc = json_dumps(jrep, JSON_SORT_KEYS | JSON_COMPACT);
-        if (!enc) {
+        if (regcomp(&re, funcs[i].re, REG_EXTENDED) != 0) {
             req->err = 500;
             goto egress;
         }
-    }
 
-    switch (err) {
-    case ENG_ERR_INTERNAL: req->err = 500; break;
-    case ENG_ERR_BAD_REQ: req->err = 400; break;
-    case ENG_ERR_BAD_ID: req->err = 404; break;
-    case ENG_ERR_DENIED: req->err = 403; break;
-    case ENG_ERR_NONE: req->err = 200; break;
+        if (regexec(&re, req->url, sizeof(m) / sizeof(*m), m, 0) != 0) {
+            regfree(&re);
+            continue;
+        }
+
+        if (((1 << parser->method) & funcs[i].methods) == 0) {
+            req->err = 405;
+            regfree(&re);
+            break;
+        }
+
+        err = funcs[i].func(req, parser->method, m, &ct, &rep);
+        regfree(&re);
+
+        switch (err) {
+        case ENG_ERR_INTERNAL: req->err = 500; break;
+        case ENG_ERR_BAD_REQ: req->err = 400; break;
+        case ENG_ERR_BAD_ID: req->err = 404; break;
+        case ENG_ERR_DENIED: req->err = 403; break;
+        case ENG_ERR_NONE: req->err = 200; break;
+        }
+
+        if (req->err == 200 && rep) {
+            enc = json_dumps(rep, JSON_SORT_KEYS | JSON_COMPACT);
+            req->err = enc ? req->err : 500;
+        }
+
+        json_decref(rep);
+        break;
     }
 
 egress:
@@ -242,15 +269,13 @@ egress:
     if (enc)
         dprintf(req->fd, "%s", enc);
 
-    json_decref(jreq);
-    json_decref(jrep);
-    free(req->url);
+    memset(req->url, 0, sizeof(req->url));
+
     free(req->body);
     free(enc);
 
     req->err = 0;
     req->blen = 0;
-    req->url = NULL;
     req->body = NULL;
     return 0;
 }
@@ -269,11 +294,6 @@ main(int argc, char *argv[])
     json_t *ctx = NULL;
     size_t lfds = 0;
     int engfd = -1;
-
-    OpenSSL_add_all_algorithms();
-
-    if (RAND_poll() <= 0)
-        return EXIT_FAILURE;
 
     if (argc != 3 ||
         strcmp(argv[1], "jose") != 0 ||
@@ -379,6 +399,5 @@ egress:
 
     json_decref(cfg);
     json_decref(ctx);
-    EVP_cleanup();
     return EXIT_FAILURE;
 }

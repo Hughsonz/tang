@@ -21,6 +21,7 @@
 #include <jose/b64.h>
 #include <jose/jwk.h>
 #include <jose/jws.h>
+#include <jose/jwe.h>
 #include <jose/openssl.h>
 
 #include <openssl/ec.h>
@@ -39,7 +40,10 @@
 
 /**
  * The ctx structure looks like this: {
- *   "inotify": { <attr>: [ <path(string)>, <wd(integer)> ], ... },
+ *   "inotify": {
+ *     "database": [ <path(string)>, <wd(integer)> ],
+ *     "blacklist": [ <path(string)>, <wd(integer)> ],
+ *   },
  *
  *   "database": { <path>: [ <jwk(object)>, ... ] },
  *   "blacklist": { <hash:thumbprint>: true, ... },
@@ -76,36 +80,22 @@
 #define IN_FLAGS (IN_DELETE | IN_MOVE | IN_CLOSE_WRITE | IN_CREATE)
 
 static const char *hashes[] = {
-    "sha224",
     "sha256",
-    "sha384",
-    "sha512",
     NULL
 };
 
 static bool
-ktp_valid_syntax(const char *ktp)
+bid_valid(const char *bid)
 {
-    for (size_t i = 0; hashes[i]; i++) {
-        size_t tlen = jose_jwk_thumbprint_len(hashes[i]);
-        size_t hlen = strlen(hashes[i]);
+    uint8_t id[4096];
 
-        if (strncmp(hashes[i], ktp, hlen) != 0)
-            continue;
+    if (!bid)
+        return false;
 
-        if (ktp[hlen++] != ':')
-            continue;
+    if (jose_b64_dlen(strlen(bid)) > sizeof(id))
+        return false;
 
-        if (strlen(ktp) != hlen + tlen)
-            continue;
-
-        uint8_t thp[tlen];
-
-        if (jose_b64_decode_buf(&ktp[hlen], thp))
-            return true;
-    }
-
-    return false;
+    return jose_b64_decode_buf(bid, id);
 }
 
 static const char *
@@ -140,7 +130,6 @@ load_jwks(const char *db, const char *name)
     json_t *arr = NULL;
     size_t i = 0;
 
-#warning TODO
     snprintf(fn, sizeof(fn) - 1, "%s/%s", db, name);
 
     jwkset = json_load_file(fn, 0, NULL);
@@ -150,28 +139,36 @@ load_jwks(const char *db, const char *name)
     }
 
     arr = json_incref(json_object_get(jwkset, "keys"));
-    if (!json_is_array(arr))
-        arr = json_pack("[o]", "keys", jwkset);
+    if (!json_is_array(arr)) {
+        json_decref(arr);
+        arr = json_pack("[O]", jwkset);
+    }
+
+    json_decref(jwkset);
 
     json_array_foreach(arr, i, jwk) {
-        if (json_unpack(jwk, "{s?s,s?s}", "kty", &kty, "use", &use) == -1)
-            goto error;
+        const char *use = NULL;
+        const char *msg = NULL;
+        json_t *kid = NULL;
 
-        if (!kty || strcmp(kty, "EC") != 0)
-            goto error;
+        kid = jose_jwk_thumbprint_json(jwk, hashes[0]);
+        if (json_object_set_new(jwk, "kid", kid) < 0)
+            msg = "Error making JWK thumbprint!";
 
-        if (!use || 
+        else if (json_unpack(jwk, "{s?s}", "use", &use) == -1)
+            msg = "Error unpacking JWK!";
 
+        else if (!use)
+            msg = "Not loading JWK without use!";
+
+        if (msg) {
+            fprintf(stderr, "%s %s", msg, fn);
+            json_decref(arr);
+            return NULL;
+        }
     }
 
-    if (json_unpack_ex(jwk, NULL, JSON_VALIDATE_ONLY,
-                       "{s:s,s:s,s:[]}", "kid", "use", "key_ops") == -1) {
-        fprintf(stderr, "JWK failed to validate: %s!\n", fn);
-        json_decref(jwk);
-        return NULL;
-    }
-
-    return jwk;
+    return arr;
 }
 
 static json_t *
@@ -181,7 +178,7 @@ make_jwkset(json_t *ctx)
     json_t *jwkset = NULL;
     json_t *val = NULL;
 
-    jwkset = json_pack("{s:[],s:[]}", "keys", "hashes");
+    jwkset = json_pack("{s:[]}", "keys");
     if (!jwkset)
         return NULL;
 
@@ -206,11 +203,6 @@ make_jwkset(json_t *ctx)
 
             json_array_append_new(json_object_get(jwkset, "keys"), cpy);
         }
-    }
-
-    for (size_t i = 0; hashes[i]; i++) {
-        json_array_append_new(json_object_get(jwkset, "hashes"),
-                              json_string(hashes[i]));
     }
 
     return jwkset;
@@ -260,19 +252,8 @@ make_adv(json_t *ctx)
     json_t *val = NULL;
     json_t *jws = NULL;
     json_t *adv = NULL;
-    char *pub = NULL;
 
     jws = make_jws(ctx);
-    if (!jws)
-        return NULL;
-
-    pub = json_dumps(jws, JSON_SORT_KEYS | JSON_COMPACT);
-    json_decref(jws);
-    if (!pub)
-        return NULL;
-
-    jws = json_string(pub);
-    free(pub);
     if (!jws)
         return NULL;
 
@@ -286,7 +267,6 @@ make_adv(json_t *ctx)
 
         json_array_foreach(val, i, jwk) {
             json_t *sig = NULL;
-            char *prv = NULL;
 
             sig = json_deep_copy(jws);
             if (!sig)
@@ -298,29 +278,10 @@ make_adv(json_t *ctx)
                 continue;
             }
 
-            prv = json_dumps(sig, JSON_SORT_KEYS | JSON_COMPACT);
-            json_decref(sig);
-            if (!prv)
-                continue;
-
-            sig = json_string(prv);
-            free(prv);
-            if (!sig)
-                continue;
-
             for (size_t j = 0; hashes[j]; j++) {
-                size_t len = 0;
-
-                len = jose_jwk_thumbprint_len(hashes[i]);
-                if (len == 0)
-                    continue;
-
-                char tp[strlen(hashes[i]) + len + 2];
-
-                strcpy(tp, hashes[i]);
-                strcat(tp, ":");
-                if (jose_jwk_thumbprint_buf(jwk, hashes[i], &tp[strlen(tp)]))
-                    json_object_set(adv, tp, key[0] == '.' ? sig : jws);
+                char thp[jose_jwk_thumbprint_len(hashes[j]) + 1];
+                if (jose_jwk_thumbprint_buf(jwk, hashes[j], thp))
+                    json_object_set(adv, thp, key[0] == '.' ? sig : jws);
             }
 
             json_decref(sig);
@@ -346,17 +307,8 @@ make_rec(const json_t *ctx)
     json_object_foreach(json_object_get(ctx, "database"), key, val) {
         json_array_foreach(val, i, jwk) {
             for (size_t j = 0; hashes[j]; j++) {
-                size_t len = 0;
-
-                len = jose_jwk_thumbprint_len(hashes[i]);
-                if (len == 0)
-                    continue;
-
-                char thp[strlen(hashes[i]) + len + 2];
-
-                strcpy(thp, hashes[i]);
-                strcat(thp, ":");
-                if (jose_jwk_thumbprint_buf(jwk, hashes[i], &thp[strlen(thp)]))
+                char thp[jose_jwk_thumbprint_len(hashes[j]) + 1];
+                if (jose_jwk_thumbprint_buf(jwk, hashes[j], thp))
                     json_object_set(rec, thp, jwk);
             }
         }
@@ -491,15 +443,15 @@ eng_event(json_t *ctx, int fd)
 }
 
 static eng_err_t
-eng_add(json_t *ctx, const char *ktp)
+eng_add(json_t *ctx, const char *bid)
 {
     const char *blp = NULL;
     int fd = -1;
 
-    if (!ktp_valid_syntax(ktp))
+    if (!bid_valid(bid))
         return ENG_ERR_BAD_ID;
 
-    blp = make_blpath(ctx, ktp);
+    blp = make_blpath(ctx, bid);
     if (!blp)
         return ENG_ERR_INTERNAL;
 
@@ -512,14 +464,14 @@ eng_add(json_t *ctx, const char *ktp)
 }
 
 static eng_err_t
-eng_del(json_t *ctx, const char *ktp)
+eng_del(json_t *ctx, const char *bid)
 {
     const char *blp = NULL;
 
-    if (!ktp_valid_syntax(ktp))
+    if (!bid_valid(bid))
         return ENG_ERR_BAD_ID;
 
-    blp = make_blpath(ctx, ktp);
+    blp = make_blpath(ctx, bid);
     if (!blp)
         return ENG_ERR_INTERNAL;
 
@@ -527,200 +479,178 @@ eng_del(json_t *ctx, const char *ktp)
 }
 
 static eng_err_t
-eng_adv(json_t *ctx, const char *ktp, const char **o)
+eng_adv(json_t *ctx, const char *kid, json_t **rep)
 {
     int r = 0;
 
-    if (!ktp_valid_syntax(ktp))
-        return ENG_ERR_BAD_ID;
-
-    r = json_unpack(ctx, "{s:{s:s}}", "adv", ktp ? ktp : "default", o);
-    return r == 0 ? ENG_ERR_NONE : ktp ? ENG_ERR_BAD_ID : ENG_ERR_INTERNAL;
-}
-
-static EC_POINT *
-recover(const EC_GROUP *grp, const EC_POINT *pub,
-        const BIGNUM *prv, BN_CTX *ctx)
-{
-    EC_POINT *p = NULL;
-    BIGNUM *ord = NULL;
-    BIGNUM *inv = NULL;
-
-    p = EC_POINT_new(grp);
-    ord = BN_new();
-    inv = BN_new();
-    if (!ord || !inv)
-        goto error;
-
-    if (EC_GROUP_get_order(grp, ord, ctx) <= 0)
-        goto error;
-
-    if (!BN_mod_inverse(inv, prv, ord, ctx))
-        goto error;
-
-    if (EC_POINT_mul(grp, p, NULL, pub, prv, ctx) <= 0)
-        goto error;
-
-    BN_free(ord);
-    BN_free(inv);
-    return p;
-
-error:
-    EC_POINT_free(p);
-    BN_free(ord);
-    BN_free(inv);
-    return NULL;
-}
-
-static inline bool
-hex2oct(const char *hex, uint8_t oct[])
-{
-    for (size_t i = 0; hex[i]; i++) {
-        uint8_t b;
-
-        switch (hex[i]) {
-        case '0': b = 0;
-        case '1': b = 1;
-        case '2': b = 2;
-        case '3': b = 3;
-        case '4': b = 4;
-        case '5': b = 5;
-        case '6': b = 6;
-        case '7': b = 7;
-        case '8': b = 8;
-        case '9': b = 9;
-        case 'a': b = 10;
-        case 'b': b = 11;
-        case 'c': b = 12;
-        case 'd': b = 13;
-        case 'e': b = 14;
-        case 'f': b = 15;
-        default: return false;
-        }
-
-        if (i % 2)
-            oct[i / 2] = b << 4;
-        else
-            oct[i / 2] |= b;
-    }
-
-    return true;
-}
-
-static bool
-bid_valid(const char *bid, const EC_GROUP *grp, const EC_POINT *p, BN_CTX *ctx)
-{
-    const EVP_MD *md = NULL;
-
-    md = get_md(bid);
-    if (!md)
-        return false;
-
-    uint8_t enc[(EC_GROUP_get_degree(grp) + 7) * 8 * 2 + 1];
-    uint8_t hsh[EVP_MD_size(md)];
-    uint8_t oct[EVP_MD_size(md)];
-
-    if (RAND_bytes(hsh, sizeof(hsh)) <= 0)
-        return false;
-    if (strlen(strchr(bid, ':') + 1) != sizeof(oct) * 2)
-        return false;
-    if (!hex2oct(strchr(bid, ':') + 1, oct))
-        return false;
-
-    if (EC_POINT_point2oct(grp, p, POINT_CONVERSION_UNCOMPRESSED,
-                              enc, sizeof(enc), ctx) != sizeof(enc))
-        return false;
-
-    if (EVP_Digest(enc, sizeof(enc), hsh, NULL, md, NULL) <= 0)
-        return false;
-
-    return CRYPTO_memcmp(hsh, oct, sizeof(oct)) == 0;
+    r = json_unpack(ctx, "{s:{s:O}}", "adv", kid ? kid : "default", rep);
+    return r == 0 ? ENG_ERR_NONE : kid ? ENG_ERR_BAD_ID : ENG_ERR_INTERNAL;
 }
 
 static eng_err_t
-eng_rec(json_t *ctx, const char *ktp, const json_t *req, json_t **rep)
+anonymous(json_t *ctx, const char *key, const json_t *jwk, json_t **rep)
 {
-    eng_err_t ret = ENG_ERR_INTERNAL;
+    eng_err_t err = ENG_ERR_INTERNAL;
     const EC_GROUP *grp = NULL;
-    const char *blpath = NULL;
-    const json_t *a = NULL;
-    const json_t *b = NULL;
-    const json_t *x = NULL;
-    const json_t *y = NULL;
-    const char *ai = NULL;
-    const char *bi = NULL;
-    EC_POINT *p = NULL;
+    json_t *prv = NULL;
+    EC_KEY *lcl = NULL;
+    EC_KEY *rem = NULL;
     BN_CTX *bnc = NULL;
-    EC_KEY *A = NULL;
-    EC_KEY *B = NULL;
-    EC_KEY *X = NULL;
-    EC_KEY *Y = NULL;
+    EC_POINT *r = NULL;
 
-    *rep = NULL;
-
-    /* Check the blacklist. */
-    if (!ktp_valid_syntax(ktp))
-        return ENG_ERR_BAD_ID;
-    blpath = make_blpath(ctx, bid);
-    if (!blpath)
-        return ENG_ERR_INTERNAL;
-    if (stat(blpath, &(struct stat) {}) == 0)
-        return ENG_ERR_DENIED;
-
-    /* Load all the keys. */
-    if (json_unpack((json_t *) req, "{s:s,s:s,s:s,s:o:s:o}",
-                    "a", &ai, "b", &bi, "x", &x, "y", &y) == -1)
+    if (json_unpack(ctx, "{s:{s:o}}", "rec", key, &prv) == -1)
         return ENG_ERR_BAD_REQ;
 
-    a = find_key(ctx, ai);
-    b = find_key(ctx, bi);
-    if (!a || !b)
+    if (!jose_jwk_allowed(prv, "tang", NULL))
         return ENG_ERR_BAD_REQ;
 
-    A = jose_openssl_jwk_to_EC_KEY(a);
-    B = jose_openssl_jwk_to_EC_KEY(b);
-    X = jose_openssl_jwk_to_EC_KEY(x);
-    Y = jose_openssl_jwk_to_EC_KEY(y);
     bnc = BN_CTX_new();
-    if (!A || !B || !X || !Y || !bnc)
-        goto egress;
+    if (!bnc)
+        return ENG_ERR_INTERNAL;
 
-    /* Ensure all the keys are in the same group. */
-    grp = EC_KEY_get0_group(A);
-    if (EC_GROUP_cmp(grp, EC_KEY_get0_group(X), bnc) != 0 ||
-        EC_GROUP_cmp(grp, EC_KEY_get0_group(Y), bnc) != 0 ||
-        EC_GROUP_cmp(grp, EC_KEY_get0_group(B), bnc) != 0) {
-        ret = ENG_ERR_BAD_REQ;
-        goto egress;
-    }
-
-    /* Recover the point used to generate the ID. */
-    p = recover(grp, EC_KEY_get0_public_key(X),
-                  EC_KEY_get0_private_key(A), bnc);
-    if (!p)
-        goto egress;
-
-    /* Validate the ID. */
-    if (!bid_valid(bid, grp, p, bnc)) {
-        ret = ENG_ERR_BAD_REQ;
+    lcl = jose_openssl_jwk_to_EC_KEY(prv);
+    rem = jose_openssl_jwk_to_EC_KEY(jwk);
+    grp = EC_KEY_get0_group(lcl);
+    if (!lcl || !rem || EC_GROUP_cmp(grp, EC_KEY_get0_group(rem), bnc) != 0) {
+        err = ENG_ERR_BAD_REQ;
         goto egress;
     }
 
-    /* Perform our algorithm. */
-    if (EC_POINT_add(grp, p, p, EC_KEY_get0_public_key(Y), bnc) <= 0 ||
-        EC_POINT_mul(grp, p, NULL, p, EC_KEY_get0_private_key(B), bnc) <= 0)
+    r = EC_POINT_new(grp);
+    if (!r)
         goto egress;
 
-    *rep = jose_openssl_jwk_from_EC_POINT(grp, p, NULL);
+    if (EC_POINT_mul(grp, r, NULL, EC_KEY_get0_public_key(rem),
+                     EC_KEY_get0_private_key(lcl), bnc) <= 0)
+        goto egress;
+
+    *rep = jose_openssl_jwk_from_EC_POINT(EC_KEY_get0_group(rem), r, NULL);
+    if (!*rep)
+        goto egress;
+
+    err = ENG_ERR_NONE;
 
 egress:
-    EC_POINT_free(p);
+    EC_POINT_free(r);
+    EC_KEY_free(lcl);
+    EC_KEY_free(rem);
     BN_CTX_free(bnc);
-    EC_KEY_free(A);
-    EC_KEY_free(B);
-    EC_KEY_free(X);
-    EC_KEY_free(Y);
-    return *rep ? ENG_ERR_NONE : ret;
+    return err;
+}
+
+static json_t *
+decrypt(json_t *ctx, const json_t *jwe, const json_t *rcp)
+{
+    const json_t *jwk = NULL;
+    const char *kid = NULL;
+    json_t *hdr = NULL;
+    json_t *cek = NULL;
+    json_t *pt = NULL;
+
+    if (!rcp) {
+        json_t *rcps = NULL;
+
+        rcps = json_incref(json_object_get(jwe, "recipients"));
+        if (json_is_array(rcps)) {
+            size_t i = 0;
+
+            json_array_foreach(rcps, i, rcp) {
+                pt = decrypt(ctx, jwe, rcp);
+                if (pt)
+                    break;
+            }
+        } else if (!rcps) {
+            pt = decrypt(ctx, jwe, rcp);
+        }
+
+        return pt;
+    }
+
+    hdr = jose_jwe_merge_header(jwe, rcp);
+    if (json_unpack(hdr, "{s:s}", "kid", &kid) == -1)
+        goto egress;
+
+    if (json_unpack(ctx, "{s:{s:o}}", "rec", kid, &jwk) == -1)
+        goto egress;
+
+    cek = jose_jwe_unwrap(jwe, rcp, jwk);
+    if (!cek)
+        goto egress;
+
+    pt = jose_jwe_decrypt_json(jwe, cek);
+    json_decref(cek);
+
+egress:
+    json_decref(hdr);
+    return pt;
+}
+
+static eng_err_t
+eng_rec(json_t *ctx, const json_t *req, json_t **rep)
+{
+    eng_err_t err = ENG_ERR_BAD_REQ;
+    const json_t *jwe = NULL;
+    const json_t *jwk = NULL;
+    const char *key = NULL;
+    const char *otp = NULL;
+    const char *bid = NULL;
+    json_t *rec = NULL;
+    json_t *prv = NULL;
+    uint8_t *ky = NULL;
+    uint8_t *pd = NULL;
+    size_t kyl = 0;
+    size_t pdl = 0;
+    *rep = NULL;
+
+    /* If we receive an anonymous request, handle it. */
+    if (json_unpack((json_t *) req, "{s:s,s:o!}",
+                    "key", &key, "jwk", &jwk) == 0)
+        return anonymous(ctx, key, jwk, rep);
+
+    rec = decrypt(ctx, req, NULL);
+    if (!rec)
+        goto egress;
+
+    if (json_unpack(rec, "{s:o,s:s}", "jwe", &jwe, "key", &key) == -1)
+        goto egress;
+
+    prv = decrypt(ctx, jwe, NULL);
+    if (!prv)
+        goto egress;
+
+    if (json_unpack(prv, "{s:s,s:s}", "otp", &otp, "bid", &bid) == -1)
+        goto egress;
+
+    if (!bid_valid(bid))
+        goto egress;
+
+    if (json_unpack(ctx, "{s:{s:b}}", "blacklist", bid, &(int){0}) == 0) {
+        err = ENG_ERR_DENIED;
+        goto egress;
+    }
+
+    ky = jose_b64_decode(key, &kyl);
+    pd = jose_b64_decode(otp, &pdl);
+    if (!ky || !pd || kyl != pdl)
+        goto egress;
+
+    for (size_t i = 0; i < kyl; i++)
+        ky[i] ^= pd[i];
+
+    *rep = json_pack("{s:s,s:s}", "kty", "oct",
+                     "k", jose_b64_encode_json(ky, kyl));
+    err = *rep ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
+
+egress:
+    json_decref(rec);
+    json_decref(prv);
+    if (ky)
+        memset(ky, 0, kyl);
+    free(ky);
+    if (pd)
+        memset(pd, 0, pdl);
+    free(pd);
+    return err;
 }
 
 const eng_t jose = {

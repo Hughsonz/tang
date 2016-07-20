@@ -314,7 +314,6 @@ cmd_check(int argc, char *argv[])
         goto egress;
     }
 
-
     ret = EXIT_SUCCESS;
 
 egress:

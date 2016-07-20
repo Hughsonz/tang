@@ -1,0 +1,29 @@
+#!/bin/sh
+
+id="`date +%Y%m%dT%H%M%S`"
+crv="P-256"
+
+function mktmpl() {
+    echo -n { \"kty\": \"EC\",
+    echo -n   \"crv\": \"$1\",
+    echo -n   \"kid\": \"$2:$3\",
+    echo -n   \"use\": \"tang:$3\" }
+}
+
+while getopts "d:c:" opt; do
+    case $opt in
+        d)  dir=$OPTARG;;
+        c)  case $OPTARG in
+                P-256) crv="P-256"; alg="ES256";;
+                P-384) crv="P-384"; alg="ES384";;
+                P-521) crv="P-521"; alg="ES512";;
+		*) echo "Unknown curve: $OPTARG!" >&2; exit 1;;
+            esac;;
+        *) echo "Unknown argument: $opt!" >&2; exit 1;;
+    esac
+done
+
+jose gen \
+    -t "{ \"alg\": \"$alg\", \"kid\": \"$id.sig\" }" \
+    -t "`mktmpl $crv $id a`" \
+    -t "`mktmpl $crv $id b`"

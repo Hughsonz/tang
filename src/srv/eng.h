@@ -35,8 +35,9 @@ typedef struct eng {
     json_t *(*init)(const json_t *cfg, int *fd);
     void (*event)(json_t *ctx, int fd);
 
-    eng_err_t (*add)(json_t *ctx, const char *ktp);
-    eng_err_t (*del)(json_t *ctx, const char *ktp);
-    eng_err_t (*adv)(json_t *ctx, const char *ktp, const char **o);
-    eng_err_t (*rec)(json_t *ctx, const char *ktp, json_t *i, const char **o);
+    eng_err_t (*add)(json_t *ctx, const char *bid);
+    eng_err_t (*del)(json_t *ctx, const char *bid);
+
+    eng_err_t (*adv)(json_t *ctx, const char *kid, json_t **rep);
+    eng_err_t (*rec)(json_t *ctx, const json_t *req, json_t **rep);
 } eng_t;

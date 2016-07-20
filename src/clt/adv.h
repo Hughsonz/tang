@@ -1,6 +1,6 @@
 /* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
 /*
- * Copyright (c) 2015 Red Hat, Inc.
+ * Copyright (c) 2016 Red Hat, Inc.
  * Author: Nathaniel McCallum <npmccallum@redhat.com>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -19,15 +19,11 @@
 
 #pragma once
 
-#include "../asn1.h"
-#include "sbuf.h"
+#include <jansson.h>
+#include <stdbool.h>
+
+json_t *
+adv_vld(const json_t *jws, const json_t *sig);
 
 bool
-adv_signed_by(const TANG_MSG_ADV_REP *rep, EC_KEY *key, BN_CTX *ctx);
-
-TANG_MSG_ADV_REQ *
-adv_req(STACK_OF(TANG_KEY) *keys);
-
-TANG_MSG_REC_REQ *
-adv_rep(const TANG_MSG_ADV_REP *adv, STACK_OF(TANG_KEY) *keys,
-        size_t min, sbuf_t **key, BN_CTX *ctx);
+adv_rep(const json_t *jwk, size_t bytes, json_t **state, json_t **key);

@@ -18,238 +18,221 @@
  */
 
 #include "adv.h"
-#include "../conv.h"
+#include <jose/b64.h>
+#include <jose/jwk.h>
+#include <jose/jws.h>
+#include <jose/jwe.h>
+#include <jose/openssl.h>
 
-#include <openssl/evp.h>
-#include <openssl/ecdsa.h>
-#include <openssl/objects.h>
 #include <openssl/rand.h>
 
-static bool
-valid_sig(TANG_SIG *sig, EC_KEY *key, const uint8_t *body, size_t size)
-{
-    unsigned char hash[EVP_MAX_MD_SIZE] = {};
-    unsigned int hlen = sizeof(hash);
-    ECDSA_SIG *ecdsa = NULL;
-    const EVP_MD *md = NULL;
-    int r;
+#include <string.h>
 
-    switch (OBJ_obj2nid(sig->type)) {
-    case NID_ecdsa_with_SHA224: md = EVP_sha224(); break;
-    case NID_ecdsa_with_SHA256: md = EVP_sha256(); break;
-    case NID_ecdsa_with_SHA384: md = EVP_sha384(); break;
-    case NID_ecdsa_with_SHA512: md = EVP_sha512(); break;
-    default: return false;
+static bool
+anon(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
+{
+    const int iter = 1000;
+    EC_POINT *k = NULL;
+    BN_CTX *ctx = NULL;
+    EC_KEY *lcl = NULL;
+    EC_KEY *rem = NULL;
+    char *pass = NULL;
+    uint8_t ky[bytes];
+    uint8_t st[bytes];
+
+    *jwk = NULL;
+    *state = NULL;
+
+    rem = jose_openssl_jwk_to_EC_KEY(key);
+    if (!rem)
+        goto egress;
+
+    lcl = EC_KEY_new();
+    if (!lcl)
+        goto egress;
+
+    if (EC_KEY_set_group(lcl, EC_KEY_get0_group(rem)) <= 0)
+        goto egress;
+
+    if (EC_KEY_generate_key(lcl) <= 0)
+        goto egress;
+
+    k = EC_POINT_new(EC_KEY_get0_group(rem));
+    if (!k)
+        goto egress;
+
+    ctx = BN_CTX_new();
+    if (!ctx)
+        goto egress;
+
+    if (EC_POINT_mul(EC_KEY_get0_group(rem), k, NULL,
+                     EC_KEY_get0_public_key(rem),
+                     EC_KEY_get0_private_key(lcl), ctx) <= 0)
+        goto egress;
+
+    if (RAND_bytes(st, sizeof(st)) <= 0)
+        goto egress;
+
+    pass = EC_POINT_point2hex(EC_KEY_get0_group(lcl), k,
+                              POINT_CONVERSION_COMPRESSED, ctx);
+    if (!pass)
+        goto egress;
+
+    if (PKCS5_PBKDF2_HMAC(pass, strlen(pass), st, bytes, iter,
+                          EVP_sha256(), bytes, ky) <= 0)
+        goto egress;
+
+    *jwk = json_pack("{s:s,s:o}", "kty", "oct",
+                     "k", jose_b64_encode_json(ky, bytes));
+    if (!*jwk)
+        return false;
+
+    *state = json_pack("{s:i,s:s,s:O,s:o,s:{s:O,s:o}}",
+                       "iter", iter, "hash", "sha256", "jwk", key,
+                       "salt", jose_b64_encode_json(st, bytes),
+                       "req",
+                           "kid", json_object_get(key, "kid"),
+                           "jwk", jose_openssl_jwk_from_EC_POINT(
+                                                   EC_KEY_get0_group(lcl),
+                                                   EC_KEY_get0_public_key(lcl),
+                                                   NULL));
+
+egress:
+    memset(ky, 0, sizeof(ky));
+    memset(st, 0, sizeof(st));
+
+    if (!*state) {
+        json_decref(*jwk);
+        *jwk = NULL;
     }
 
-    if (EVP_Digest(body, size, hash, &hlen, md, NULL) <= 0)
-      return false;
+    OPENSSL_free(pass);
+    EC_POINT_free(k);
+    BN_CTX_free(ctx);
+    EC_KEY_free(lcl);
+    EC_KEY_free(rem);
+    return *state != NULL;
+}
 
-    ecdsa = d2i_ECDSA_SIG(NULL,
-                          &(const unsigned char *) { sig->sig->data },
-                          sig->sig->length);
-    if (!ecdsa)
-      return false;
+static bool
+wrap(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
+{
+    uint8_t ky[bytes * 3];
+    json_t *jwe = NULL;
+    json_t *cek = NULL;
+    json_t *pt = NULL;
 
-    r = ECDSA_do_verify(hash, hlen, ecdsa, key);
-    ECDSA_SIG_free(ecdsa);
-    return r == 1;
+    *state = NULL;
+
+    if (RAND_bytes(ky, sizeof(ky)) <= 0)
+        return false;
+
+    *jwk = json_pack("{s:s,s:o}", "kty", "oct",
+                     "k", jose_b64_encode_json(ky, bytes));
+    if (!*jwk)
+        return false;
+
+    for (size_t i = 0; i < bytes; i++)
+        ky[i] ^= ky[bytes + i];
+
+    pt = json_pack("{s:o,s:o}", "key", jose_b64_encode_json(ky, bytes),
+                   "bid", jose_b64_encode_json(&ky[bytes * 2], bytes));
+    if (!pt)
+        goto egress;
+
+    jwe = json_object();
+    cek = json_object();
+    if (!jwe || !cek)
+        goto egress;
+
+    if (!jose_jwe_wrap(jwe, cek, key, NULL))
+        goto egress;
+
+    if (!jose_jwe_encrypt_json(jwe, cek, pt))
+        goto egress;
+
+    *state = json_pack("{s:O,s:O,s:o}", "jwe", jwe,
+                       "bid", json_object_get(pt, "bid"),
+                       "otp", jose_b64_encode_json(&ky[bytes], bytes));
+
+egress:
+    memset(ky, 0, sizeof(ky));
+
+    if (!*state) {
+        json_decref(*jwk);
+        *jwk = NULL;
+    }
+
+    json_decref(jwe);
+    json_decref(cek);
+    json_decref(pt);
+    return *state != NULL;
+}
+
+json_t *
+adv_vld(const json_t *jws, const json_t *sig)
+{
+    json_t *jwkset = NULL;
+    json_t *keys = NULL;
+    size_t sigs = 0;
+
+    jwkset = jose_b64_decode_json_load(json_object_get(jws, "payload"));
+    if (!jwkset)
+        return NULL;
+
+    keys = json_object_get(jwkset, "keys");
+    if (!json_is_array(keys))
+        goto error;
+
+    for (size_t i = 0; i < json_array_size(keys); i++) {
+        json_t *key = json_array_get(keys, i);
+
+        if (!jose_jwk_allowed(key, NULL, "verify"))
+            continue;
+
+        if (!jose_jws_verify(jws, key))
+            goto error;
+
+        sigs++;
+    }
+
+    if (sigs == 0)
+        goto error;
+
+    if (sig && !jose_jws_verify(jws, sig))
+        goto error;
+
+    keys = json_incref(keys);
+    json_decref(jwkset);
+    return keys;
+
+error:
+    json_decref(jwkset);
+    return NULL;
 }
 
 bool
-adv_signed_by(const TANG_MSG_ADV_REP *rep, EC_KEY *key, BN_CTX *ctx)
+adv_rep(const json_t *jwk, size_t bytes, json_t **state, json_t **key)
 {
-    uint8_t *body = NULL;
-    bool ret = false;
-    int len = 0;
+    if (jose_jwk_allowed(jwk, NULL, "tang.derive"))
+        return anon(jwk, bytes, state, key);
 
-    len = i2d_TANG_MSG_ADV_REP_BDY(rep->body, &body);
-    if (len <= 0)
-        goto egress;
+    if (jose_jwk_allowed(jwk, NULL, "encrypt"))
+        return wrap(jwk, bytes, state, key);
 
-    for (int j = 0; !ret && j < SKM_sk_num(TANG_SIG, rep->sigs); j++) {
-        TANG_SIG *sig = SKM_sk_value(TANG_SIG, rep->sigs, j);
-        ret = valid_sig(sig, key, body, len);
-    }
-
-egress:
-    OPENSSL_free(body);
-    return ret;
+    return false;
 }
 
-static bool
-valid_adv(const TANG_MSG_ADV_REP *rep, STACK_OF(TANG_KEY) *keys, BN_CTX *ctx)
+/*
+static void __attribute__((constructor))
+constructor(void)
 {
-    bool sig = keys ? SKM_sk_num(TANG_KEY, keys) == 0 : true;
+    jose_jwk_op_t tang = {
+        .pub = "tang.derive",
+        .prv = "tang.recover",
+        .use = "tang"
+    };
 
-    /* Ensure the advertisement is signed by all advertised signing keys. */
-    for (int i = 0; i < SKM_sk_num(TANG_KEY, rep->body->sigs); i++) {
-        TANG_KEY *tkey = NULL;
-        EC_KEY *eckey = NULL;
-
-        tkey = SKM_sk_value(TANG_KEY, rep->body->sigs, i);
-        if (!tkey)
-            return false;
-
-        eckey = conv_tkey2eckey(tkey, ctx);
-        if (!eckey)
-            return false;
-
-        if (!adv_signed_by(rep, eckey, ctx)) {
-            EC_KEY_free(eckey);
-            return false;
-        }
-
-        EC_KEY_free(eckey);
-    }
-
-    /* Ensure the advertisement is signed by at least one requested key. */
-    for (int i = 0; !sig && i < SKM_sk_num(TANG_KEY, keys); i++) {
-        TANG_KEY *tkey = NULL;
-        EC_KEY *eckey = NULL;
-
-        tkey = SKM_sk_value(TANG_KEY, keys, i);
-        if (!tkey)
-            return false;
-
-        eckey = conv_tkey2eckey(tkey, ctx);
-        if (!eckey)
-            return false;
-
-        sig = adv_signed_by(rep, eckey, ctx);
-        EC_KEY_free(eckey);
-    }
-
-    return SKM_sk_num(TANG_KEY, rep->body->recs) > 0
-        && SKM_sk_num(TANG_KEY, rep->body->sigs) > 0
-        && sig;
+    jose_jwk_register_op(&tang);
 }
-
-TANG_MSG_ADV_REQ *
-adv_req(STACK_OF(TANG_KEY) *keys)
-{
-    TANG_MSG_ADV_REQ *adv = NULL;
-
-    adv = TANG_MSG_ADV_REQ_new();
-    if (!adv)
-        return NULL;
-
-    if (!keys)
-        return adv;
-
-    for (int i = 0; i < SKM_sk_num(TANG_KEY, keys); i++) {
-        TANG_KEY *key;
-
-        key = TANG_KEY_copy(SKM_sk_value(TANG_KEY, keys, i));
-        if (!key)
-            goto error;
-
-        if (SKM_sk_push(TANG_KEY, adv->keys, key) <= 0) {
-            TANG_KEY_free(key);
-            goto error;
-        }
-    }
-
-    return adv;
-
-error:
-    TANG_MSG_ADV_REQ_free(adv);
-    return NULL;
-}
-
-static EC_KEY *
-select_key(STACK_OF(TANG_KEY) *keys, int min, BN_CTX *ctx)
-{
-    for (int i = 0; i < SKM_sk_num(TANG_KEY, keys); i++) {
-    	TANG_KEY *key = SKM_sk_value(TANG_KEY, keys, i);
-    	EC_KEY *eckey = NULL;
-
-        if (!key)
-            continue;
-
-        eckey = conv_tkey2eckey(key, ctx);
-        if (!eckey)
-            continue;
-
-        if (EC_GROUP_get_degree(EC_KEY_get0_group(eckey)) < min * 2) {
-            EC_KEY_free(eckey);
-            continue;
-        }
-
-        return eckey;
-    }
-
-    return NULL;
-}
-
-TANG_MSG_REC_REQ *
-adv_rep(const TANG_MSG_ADV_REP *adv, STACK_OF(TANG_KEY) *keys,
-        size_t min, sbuf_t **key, BN_CTX *ctx)
-{
-    TANG_MSG_REC_REQ *req = NULL;
-    const EC_GROUP *g = NULL;
-    EC_POINT *p = NULL;
-    EC_KEY *r = NULL;
-    EC_KEY *l = NULL;
-    int bytes = 0;
-
-    if (!valid_adv(adv, keys, ctx))
-    	return NULL;
-
-
-    r = select_key(adv->body->recs, min, ctx);
-    if (!r)
-    	return NULL;
-    g = EC_KEY_get0_group(r);
-    if (!g)
-    	goto error;
-
-
-    bytes = (EC_GROUP_get_degree(g) + 7) / 8;
-    if (RAND_load_file("/dev/urandom", bytes) != bytes)
-        goto error;
-
-
-    l = EC_KEY_new();
-    if (!l)
-    	goto error;
-
-    if (EC_KEY_set_group(l, g) <= 0)
-    	goto error;
-
-    if (EC_KEY_generate_key(l) <= 0)
-    	goto error;
-
-
-    req = TANG_MSG_REC_REQ_new();
-    if (!req)
-        goto error;
-
-    if (conv_eckey2tkey(r, req->key, ctx) != 0)
-    	goto error;
-
-    if (conv_point2os(g, EC_KEY_get0_public_key(l), req->x, ctx) != 0)
-        goto error;
-
-
-    p = EC_POINT_new(g);
-    if (!p)
-    	goto error;
-
-    if (EC_POINT_mul(g, p, NULL, EC_KEY_get0_public_key(r),
-                     EC_KEY_get0_private_key(l), ctx) <= 0)
-        goto error;
-
-    *key = sbuf_from_point(g, p, ctx);
-    if (!*key)
-    	goto error;
-
-    return req;
-
-error:
-    TANG_MSG_REC_REQ_free(req);
-    EC_POINT_free(p);
-    EC_KEY_free(r);
-    EC_KEY_free(l);
-    return NULL;
-}
+*/

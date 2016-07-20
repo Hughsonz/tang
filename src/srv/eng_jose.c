@@ -662,3 +662,16 @@ const eng_t jose = {
     eng_adv,
     eng_rec,
 };
+
+/*
+static void __attribute__((constructor))
+constructor(void)
+{
+    jose_jwk_op_t tang = {
+        .pub = "deriveKey",
+        .prv = "recoverKey",
+    };
+
+    jose_jwk_register_op(&tang);
+}
+*/

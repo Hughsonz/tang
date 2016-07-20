@@ -1,6 +1,6 @@
 /* vim: set tabstop=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80: */
 /*
- * Copyright (c) 2015 Red Hat, Inc.
+ * Copyright (c) 2016 Red Hat, Inc.
  * Author: Nathaniel McCallum <npmccallum@redhat.com>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -19,11 +19,11 @@
 
 #pragma once
 
-#include "../asn1.h"
-#include "sbuf.h"
+#include <jansson.h>
+#include <stdbool.h>
 
-EC_KEY *
-rec_req(TANG_MSG_REC_REQ *rec, BN_CTX *ctx);
+json_t *
+rec_req(json_t *state);
 
-sbuf_t *
-rec_rep(const TANG_MSG_REC_REP *rec, const EC_KEY *key, BN_CTX *ctx);
+json_t *
+rec_rep(json_t *state, const json_t *rep);

@@ -135,11 +135,10 @@ AC_DEFINE([TANG_PORT], [5700])
 
 AC_CONFIG_FILES([
     Makefile
-    src/Makefile
-    src/srv/Makefile
-    src/clt/Makefile
-    src/clt/luks/Makefile
-    src/clt/luks/askp/Makefile
+    srv/Makefile
+    clt/Makefile
+    clt/luks/Makefile
+    clt/luks/askp/Makefile
     tests/Makefile
 ])
 AC_OUTPUT

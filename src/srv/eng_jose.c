@@ -233,7 +233,7 @@ make_jws(json_t *ctx)
             continue;
 
         json_array_foreach(val, i, jwk) {
-            if (!jose_jwk_allowed(jwk, NULL, "sign"))
+            if (!jose_jwk_allowed(jwk, true, NULL, "sign"))
                 continue;
 
             if (!jose_jws_sign(jws, jwk, json_pack("{s:{s:s}}", "protected",
@@ -488,7 +488,7 @@ eng_adv(json_t *ctx, const char *kid, json_t **rep)
 }
 
 static eng_err_t
-anonymous(json_t *ctx, const char *key, const json_t *jwk, json_t **rep)
+anon(json_t *ctx, const char *key, const json_t *jwk, json_t **rep)
 {
     eng_err_t err = ENG_ERR_INTERNAL;
     const EC_GROUP *grp = NULL;
@@ -501,7 +501,7 @@ anonymous(json_t *ctx, const char *key, const json_t *jwk, json_t **rep)
     if (json_unpack(ctx, "{s:{s:o}}", "rec", key, &prv) == -1)
         return ENG_ERR_BAD_REQ;
 
-    if (!jose_jwk_allowed(prv, "tang", NULL))
+    if (!jose_jwk_allowed(prv, true, NULL, "tang.recover"))
         return ENG_ERR_BAD_REQ;
 
     bnc = BN_CTX_new();
@@ -560,7 +560,7 @@ decrypt(json_t *ctx, const json_t *jwe, const json_t *rcp)
                     break;
             }
         } else if (!rcps) {
-            pt = decrypt(ctx, jwe, rcp);
+            pt = decrypt(ctx, jwe, jwe);
         }
 
         return pt;
@@ -604,21 +604,21 @@ eng_rec(json_t *ctx, const json_t *req, json_t **rep)
 
     /* If we receive an anonymous request, handle it. */
     if (json_unpack((json_t *) req, "{s:s,s:o!}",
-                    "key", &key, "jwk", &jwk) == 0)
-        return anonymous(ctx, key, jwk, rep);
+                    "kid", &key, "jwk", &jwk) == 0)
+        return anon(ctx, key, jwk, rep);
 
     rec = decrypt(ctx, req, NULL);
     if (!rec)
         goto egress;
 
-    if (json_unpack(rec, "{s:o,s:s}", "jwe", &jwe, "key", &key) == -1)
+    if (json_unpack(rec, "{s:o,s:s}", "jwe", &jwe, "otp", &otp) == -1)
         goto egress;
 
     prv = decrypt(ctx, jwe, NULL);
     if (!prv)
         goto egress;
 
-    if (json_unpack(prv, "{s:s,s:s}", "otp", &otp, "bid", &bid) == -1)
+    if (json_unpack(prv, "{s:s,s:s}", "key", &key, "bid", &bid) == -1)
         goto egress;
 
     if (!bid_valid(bid))
@@ -637,7 +637,7 @@ eng_rec(json_t *ctx, const json_t *req, json_t **rep)
     for (size_t i = 0; i < kyl; i++)
         ky[i] ^= pd[i];
 
-    *rep = json_pack("{s:s,s:s}", "kty", "oct",
+    *rep = json_pack("{s:s,s:o}", "kty", "oct",
                      "k", jose_b64_encode_json(ky, kyl));
     err = *rep ? ENG_ERR_NONE : ENG_ERR_INTERNAL;
 
@@ -663,15 +663,13 @@ const eng_t jose = {
     eng_rec,
 };
 
-/*
 static void __attribute__((constructor))
 constructor(void)
 {
-    jose_jwk_op_t tang = {
+    static jose_jwk_op_t tang = {
         .pub = "deriveKey",
         .prv = "recoverKey",
     };
 
     jose_jwk_register_op(&tang);
 }
-*/

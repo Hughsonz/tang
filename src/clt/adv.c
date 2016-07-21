@@ -140,7 +140,8 @@ wrap(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
     if (!pt)
         goto egress;
 
-    jwe = json_object();
+    jwe = json_pack("{s:{s:O}}", "protected",
+                    "kid", json_object_get(key, "kid"));
     cek = json_object();
     if (!jwe || !cek)
         goto egress;
@@ -151,7 +152,7 @@ wrap(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
     if (!jose_jwe_encrypt_json(jwe, cek, pt))
         goto egress;
 
-    *state = json_pack("{s:O,s:O,s:o}", "jwe", jwe,
+    *state = json_pack("{s:O,s:O,s:O,s:o}", "jwe", jwe, "jwk", key,
                        "bid", json_object_get(pt, "bid"),
                        "otp", jose_b64_encode_json(&ky[bytes], bytes));
 
@@ -187,7 +188,7 @@ adv_vld(const json_t *jws, const json_t *sig)
     for (size_t i = 0; i < json_array_size(keys); i++) {
         json_t *key = json_array_get(keys, i);
 
-        if (!jose_jwk_allowed(key, NULL, "verify"))
+        if (!jose_jwk_allowed(key, true, NULL, "verify"))
             continue;
 
         if (!jose_jws_verify(jws, key))
@@ -214,20 +215,19 @@ error:
 bool
 adv_rep(const json_t *jwk, size_t bytes, json_t **state, json_t **key)
 {
-    if (jose_jwk_allowed(jwk, NULL, "tang.derive"))
+    if (jose_jwk_allowed(jwk, true, NULL, "tang.derive"))
         return anon(jwk, bytes, state, key);
 
-    if (jose_jwk_allowed(jwk, NULL, "encrypt"))
+    if (jose_jwk_allowed(jwk, true, NULL, "wrapKey"))
         return wrap(jwk, bytes, state, key);
 
     return false;
 }
 
-/*
 static void __attribute__((constructor))
 constructor(void)
 {
-    jose_jwk_op_t tang = {
+    static jose_jwk_op_t tang = {
         .pub = "tang.derive",
         .prv = "tang.recover",
         .use = "tang"
@@ -235,4 +235,3 @@ constructor(void)
 
     jose_jwk_register_op(&tang);
 }
-*/

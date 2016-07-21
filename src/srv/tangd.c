@@ -140,21 +140,24 @@ on_body(http_parser *parser, const char *at, size_t length)
 }
 
 static eng_err_t
-rec(req_t *r, enum http_method h, regmatch_t *m, const char **ct, json_t **rep)
+bl(req_t *r, enum http_method h, regmatch_t *m, const char **ct, json_t **rep)
 {
     char id[sizeof(r->url)] = {};
-    eng_err_t err = ENG_ERR_NONE;
-    json_t *req = NULL;
 
-    if (m[1].rm_so < m[1].rm_eo)
-        strncpy(id, &r->url[m[1].rm_so], m[1].rm_eo - m[1].rm_so);
+    strncpy(id, &r->url[m[1].rm_so], m[1].rm_eo - m[1].rm_so);
 
     switch (h) {
     case HTTP_DELETE: return jose.del(r->ctx, id);
     case HTTP_PUT: return jose.add(r->ctx, id);
-    case HTTP_POST: break;
     default: return ENG_ERR_BAD_REQ;
     }
+}
+
+static eng_err_t
+rec(req_t *r, enum http_method h, regmatch_t *m, const char **ct, json_t **rep)
+{
+    eng_err_t err = ENG_ERR_NONE;
+    json_t *req = NULL;
 
     req = json_loadb(r->body, r->blen, 0, NULL);
     if (!req)
@@ -187,12 +190,10 @@ static const struct {
             const char **ct, json_t **);
     uint64_t methods;
 } funcs[] = {
-    { "^/+rec/+([0-9A-Za-z_-]+)?$", rec,
-      (1 << HTTP_DELETE) | (1 << HTTP_PUT) | (1 << HTTP_POST) },
-    { "^/+rec$", rec,
-      (1 << HTTP_DELETE) | (1 << HTTP_PUT) | (1 << HTTP_POST) },
-    { "^/+adv/+([0-9A-Za-z_-]+)?$", adv, (1 << HTTP_GET) },
-    { "^/+adv$", adv, (1 << HTTP_GET) },
+    { "^/+rec/+([0-9A-Za-z_-]+)$", bl, (1 << HTTP_DELETE) | (1 << HTTP_PUT) },
+    { "^/+rec/*$", rec, (1 << HTTP_POST) },
+    { "^/+adv/+([0-9A-Za-z_-]+)$", adv, (1 << HTTP_GET) },
+    { "^/+adv/*$", adv, (1 << HTTP_GET) },
     {}
 };
 

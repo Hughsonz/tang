@@ -21,6 +21,8 @@
 #include "adv.h"
 #include "rec.h"
 
+#include <jose/jwk.h>
+
 #include <string.h>
 
 static int
@@ -39,8 +41,10 @@ static int
 cmd_check(int argc, char *argv[])
 {
     int ret = EXIT_FAILURE;
+    char url[8192] = {};
     json_t *keys = NULL;
     json_t *adv = NULL;
+    size_t rec = 0;
     int r = 0;
 
     if (argc != 2) {
@@ -48,7 +52,8 @@ cmd_check(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    r = http(argv[1], HTTP_GET, NULL, &adv);
+    snprintf(url, sizeof(url), "%s/adv", argv[1]);
+    r = http(url, HTTP_GET, NULL, &adv);
     if (r != 200) {
         if (r < 0)
             printf("Error fetching advertisement! %s\n", strerror(-r));
@@ -72,6 +77,10 @@ cmd_check(int argc, char *argv[])
         json_t *req = NULL;
         json_t *rep = NULL;
 
+        if (!jose_jwk_allowed(jwk, true, NULL, "tang.derive") &&
+            !jose_jwk_allowed(jwk, true, NULL, "wrapKey"))
+            continue;
+
         if (!adv_rep(jwk, 16, &state, &bef)) {
             printf("Error creating binding!\n");
             goto egress;
@@ -83,7 +92,8 @@ cmd_check(int argc, char *argv[])
             goto egress;
         }
 
-        r = http(argv[1], HTTP_POST, req, &rep);
+        snprintf(url, sizeof(url), "%s/rec", argv[1]);
+        r = http(url, HTTP_POST, req, &rep);
         if (r != 200) {
             if (r < 0)
                 printf("Error performing recovery! %s\n", strerror(-r));
@@ -109,8 +119,11 @@ cmd_check(int argc, char *argv[])
         json_decref(aft);
         json_decref(req);
         json_decref(rep);
+
+        rec++;
     }
 
+    printf("OK: %zu\n", rec);
     ret = EXIT_SUCCESS;
 
 egress:

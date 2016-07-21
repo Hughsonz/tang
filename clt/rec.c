@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "rec.h"
+#include "clt.h"
 #include <jose/b64.h>
 #include <jose/jwe.h>
 #include <jose/openssl.h>
@@ -149,7 +149,7 @@ req_wrap(json_t *state)
     if (!jose_jwe_encrypt_json(ct, cek, pt))
         goto error;
 
-    if (json_object_set_new(state, "otp", jose_b64_encode_json(otp, len)) != 0)
+    if (json_object_set_new(state, "tmp", jose_b64_encode_json(otp, len)) != 0)
         goto error;
 
     memset(otp, 0, len);
@@ -219,8 +219,13 @@ kdf(json_t *state, const EC_GROUP *grp, const EC_POINT *p, BN_CTX *ctx)
     if (PKCS5_PBKDF2_HMAC(pass, strlen(pass), st, len, iter, md, len, ky) <= 0)
         goto egress;
 
-    out = json_pack("{s:s,s:o}", "kty", "oct",
-                    "k", jose_b64_encode_json(ky, len));
+    out = json_deep_copy(json_object_get(state, "jwkt"));
+    if (out) {
+        if (json_object_set_new(out, "k", jose_b64_encode_json(ky, len)) < 0) {
+            json_decref(out);
+            out = NULL;
+        }
+    }
 
 egress:
     memset(st, 0, len);
@@ -304,7 +309,7 @@ rep_wrap(json_t *state, const json_t *rep)
     size_t otpl = 0;
     size_t keyl = 0;
 
-    otp = jose_b64_decode_json(json_object_get(state, "otp"), &otpl);
+    otp = jose_b64_decode_json(json_object_get(state, "tmp"), &otpl);
     if (!otp)
         return NULL;
 
@@ -321,8 +326,14 @@ rep_wrap(json_t *state, const json_t *rep)
     for (size_t i = 0; i < otpl; i++)
         key[i] ^= otp[i];
 
-    out = json_pack("{s:s,s:o}", "kty", "oct",
-                    "k", jose_b64_encode_json(key, keyl));
+    out = json_deep_copy(json_object_get(state, "jwkt"));
+    if (out) {
+        if (json_object_set_new(out, "k",
+                                jose_b64_encode_json(key, keyl)) < 0) {
+            json_decref(out);
+            out = NULL;
+        }
+    }
 
 egress:
     memset(otp, 0, otpl);

@@ -17,28 +17,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "http.h"
-#include "adv.h"
-#include "rec.h"
+#include "../clt.h"
 
 #include <jose/jwk.h>
 
 #include <string.h>
 
-static int
-cmd_provision(int argc, char *argv[])
-{
-    return EXIT_FAILURE;
-}
-
-static int
-cmd_recover(int argc, char *argv[])
-{
-    return EXIT_FAILURE;
-}
-
-static int
-cmd_check(int argc, char *argv[])
+int
+main(int argc, char *argv[])
 {
     int ret = EXIT_FAILURE;
     char url[8192] = {};
@@ -63,7 +49,7 @@ cmd_check(int argc, char *argv[])
         goto egress;
     }
 
-    keys = adv_vld(adv, NULL);
+    keys = adv_vld(adv);
     if (!keys) {
         printf("Error validating advertisement!\n");
         goto egress;
@@ -81,7 +67,14 @@ cmd_check(int argc, char *argv[])
             !jose_jwk_allowed(jwk, true, NULL, "wrapKey"))
             continue;
 
-        if (!adv_rep(jwk, 16, &state, &bef)) {
+        bef = json_pack("{s:s,s:i}", "kty", "oct", "bytes", 16);
+        if (!bef) {
+            printf("Error creating JWK template!\n");
+            goto egress;
+        }
+
+        state = adv_rep(jwk, bef);
+        if (!state) {
             printf("Error creating binding!\n");
             goto egress;
         }
@@ -130,43 +123,4 @@ egress:
     json_decref(keys);
     json_decref(adv);
     return ret;
-}
-
-int
-main(int argc, char *argv[])
-{
-    static const struct {
-        const char *cmd;
-        int (*func)(int argc, char *argv[]);
-    } table[] = {
-        { "provision", cmd_provision },
-        { "recover", cmd_recover },
-        { "check", cmd_check },
-        {}
-    };
-
-    const char *cmd = NULL;
-
-    if (argc >= 2) {
-        char argv0[strlen(argv[0]) + strlen(argv[1]) + 2];
-        strcpy(argv0, argv[0]);
-        strcat(argv0, " ");
-        strcat(argv0, argv[1]);
-        cmd = argv[1];
-        argv[1] = argv0;
-
-        for (size_t i = 0; table[i].cmd; i++) {
-            if (strcmp(cmd, table[i].cmd) == 0)
-                return table[i].func(argc - 1, argv + 1);
-        }
-    }
-
-    fprintf(stderr,
-"Usage: tang COMMAND [OPTIONS] [ARGUMENTS]\n"
-"\n"
-"tang provision [-o FILE] [-a ADV ...] URL ...\n"
-"tang recover   [-i FILE]\n"
-"tang check     URL\n"
-"\n");
-    return EXIT_FAILURE;
 }

@@ -17,7 +17,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "adv.h"
+#include "clt.h"
 #include <jose/b64.h>
 #include <jose/jwk.h>
 #include <jose/jws.h>
@@ -28,10 +28,11 @@
 
 #include <string.h>
 
-static bool
-anon(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
+static json_t *
+anon(const json_t *jwk, json_t *jwkt, size_t bytes)
 {
     const int iter = 1000;
+    json_t *state = NULL;
     EC_POINT *k = NULL;
     BN_CTX *ctx = NULL;
     EC_KEY *lcl = NULL;
@@ -40,10 +41,7 @@ anon(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
     uint8_t ky[bytes];
     uint8_t st[bytes];
 
-    *jwk = NULL;
-    *state = NULL;
-
-    rem = jose_openssl_jwk_to_EC_KEY(key);
+    rem = jose_openssl_jwk_to_EC_KEY(jwk);
     if (!rem)
         goto egress;
 
@@ -82,55 +80,48 @@ anon(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
                           EVP_sha256(), bytes, ky) <= 0)
         goto egress;
 
-    *jwk = json_pack("{s:s,s:o}", "kty", "oct",
-                     "k", jose_b64_encode_json(ky, bytes));
-    if (!*jwk)
-        return false;
-
-    *state = json_pack("{s:i,s:s,s:O,s:o,s:{s:O,s:o}}",
-                       "iter", iter, "hash", "sha256", "jwk", key,
-                       "salt", jose_b64_encode_json(st, bytes),
-                       "req",
-                           "kid", json_object_get(key, "kid"),
-                           "jwk", jose_openssl_jwk_from_EC_POINT(
+    state = json_pack("{s:i,s:s,s:o,s:o,s:o,s:{s:o,s:o}}",
+                      "iter", iter, "hash", "sha256",
+                      "jwk", json_deep_copy(jwk),
+                      "jwkt", json_deep_copy(jwkt),
+                      "salt", jose_b64_encode_json(st, bytes),
+                      "req",
+                          "kid", json_deep_copy(json_object_get(jwk, "kid")),
+                          "jwk", jose_openssl_jwk_from_EC_POINT(
                                                    EC_KEY_get0_group(lcl),
                                                    EC_KEY_get0_public_key(lcl),
                                                    NULL));
 
+    if (json_object_set(jwkt, "k", jose_b64_encode_json(ky, bytes)) != 0) {
+        json_decref(state);
+        state = NULL;
+    }
+
 egress:
     memset(ky, 0, sizeof(ky));
     memset(st, 0, sizeof(st));
-
-    if (!*state) {
-        json_decref(*jwk);
-        *jwk = NULL;
-    }
-
     OPENSSL_free(pass);
     EC_POINT_free(k);
     BN_CTX_free(ctx);
     EC_KEY_free(lcl);
     EC_KEY_free(rem);
-    return *state != NULL;
+    return state;
 }
 
-static bool
-wrap(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
+static json_t *
+wrap(const json_t *jwk, json_t *jwkt, size_t bytes)
 {
     uint8_t ky[bytes * 3];
+    json_t *state = NULL;
     json_t *jwe = NULL;
     json_t *cek = NULL;
     json_t *pt = NULL;
 
-    *state = NULL;
-
     if (RAND_bytes(ky, sizeof(ky)) <= 0)
         return false;
 
-    *jwk = json_pack("{s:s,s:o}", "kty", "oct",
-                     "k", jose_b64_encode_json(ky, bytes));
-    if (!*jwk)
-        return false;
+    if (json_object_set(jwkt, "k", jose_b64_encode_json(ky, bytes)) != 0)
+        goto egress;
 
     for (size_t i = 0; i < bytes; i++)
         ky[i] ^= ky[bytes + i];
@@ -140,38 +131,40 @@ wrap(const json_t *key, size_t bytes, json_t **state, json_t **jwk)
     if (!pt)
         goto egress;
 
-    jwe = json_pack("{s:{s:O}}", "protected",
-                    "kid", json_object_get(key, "kid"));
+    jwe = json_pack("{s:{s:o}}", "protected",
+                    "kid", json_deep_copy(json_object_get(jwk, "kid")));
     cek = json_object();
     if (!jwe || !cek)
         goto egress;
 
-    if (!jose_jwe_wrap(jwe, cek, key, NULL))
+    if (!jose_jwe_wrap(jwe, cek, jwk, NULL))
         goto egress;
 
     if (!jose_jwe_encrypt_json(jwe, cek, pt))
         goto egress;
 
-    *state = json_pack("{s:O,s:O,s:O,s:o}", "jwe", jwe, "jwk", key,
-                       "bid", json_object_get(pt, "bid"),
-                       "otp", jose_b64_encode_json(&ky[bytes], bytes));
+    state = json_pack("{s:O,s:o,s:o,s:O,s:o}",
+                      "jwe", jwe,
+                      "jwk", json_deep_copy(jwk),
+                      "jwkt", json_deep_copy(jwkt),
+                      "bid", json_object_get(pt, "bid"),
+                      "otp", jose_b64_encode_json(&ky[bytes], bytes));
+
+    if (json_object_del(json_object_get(state, "jwkt"), "k") != 0) {
+        json_decref(state);
+        state = NULL;
+    }
 
 egress:
     memset(ky, 0, sizeof(ky));
-
-    if (!*state) {
-        json_decref(*jwk);
-        *jwk = NULL;
-    }
-
     json_decref(jwe);
     json_decref(cek);
     json_decref(pt);
-    return *state != NULL;
+    return state;
 }
 
 json_t *
-adv_vld(const json_t *jws, const json_t *sig)
+adv_vld(const json_t *jws)
 {
     json_t *jwkset = NULL;
     json_t *keys = NULL;
@@ -200,9 +193,6 @@ adv_vld(const json_t *jws, const json_t *sig)
     if (sigs == 0)
         goto error;
 
-    if (sig && !jose_jws_verify(jws, sig))
-        goto error;
-
     keys = json_incref(keys);
     json_decref(jwkset);
     return keys;
@@ -212,16 +202,28 @@ error:
     return NULL;
 }
 
-bool
-adv_rep(const json_t *jwk, size_t bytes, json_t **state, json_t **key)
+json_t *
+adv_rep(const json_t *jwk, json_t *jwkt)
 {
+    const char *kty = NULL;
+    int bytes = 0;
+
+    if (json_unpack(jwkt, "{s:s,s:i}", "kty", &kty, "bytes", &bytes))
+        return NULL;
+
+    if (strcmp(kty, "oct") != 0 || bytes <= 0)
+        return NULL;
+
+    if (json_object_del(jwkt, "bytes") < 0)
+        return NULL;
+
     if (jose_jwk_allowed(jwk, true, NULL, "tang.derive"))
-        return anon(jwk, bytes, state, key);
+        return anon(jwk, jwkt, bytes);
 
     if (jose_jwk_allowed(jwk, true, NULL, "wrapKey"))
-        return wrap(jwk, bytes, state, key);
+        return wrap(jwk, jwkt, bytes);
 
-    return false;
+    return NULL;
 }
 
 static void __attribute__((constructor))

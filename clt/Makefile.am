@@ -1,20 +1,15 @@
 SUBDIRS = .
 EXTRA_DIST = clevis.sym
 
-AM_CFLAGS = @TANG_CFLAGS@ @libcrypto_CFLAGS@
+AM_CFLAGS = @TANG_CFLAGS@ @jose_CFLAGS@
 
 noinst_LTLIBRARIES = libclt.la
-libclt_la_SOURCES = adv.c adv.h rec.c rec.h http.c http.h
+libclt_la_SOURCES = adv.c rec.c http.c clt.h
 libclt_la_LIBADD = @jose_LIBS@ -lhttp_parser
 
-bin_PROGRAMS = tang
-tang_SOURCES = tang.c
-tang_LDADD = libclt.la
-
-# nagiosdir = $(libdir)/nagios/plugins
-# nagios_PROGRAMS = tang-nagios
-# tang_nagios_SOURCES = nagios.c
-# tang_nagios_LDADD = libclt.la
+nagiosdir = $(libdir)/nagios/plugins
+nagios_PROGRAMS = nagios/tang
+nagios_tang_LDADD = libclt.la
 
 # if USE_CLEVIS
 # clevispin_LTLIBRARIES = tang.la

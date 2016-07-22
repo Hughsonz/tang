@@ -17,13 +17,14 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "../clt.h"
+#include "clt.h"
 
 #include <jose/b64.h>
 #include <jose/jwk.h>
 #include <jose/jwe.h>
 
 #include <string.h>
+#include <time.h>
 
 static uint8_t *
 readkey(FILE *file, size_t *len)
@@ -314,6 +315,189 @@ egress:
     return ret;
 }
 
+static double
+curtime(void)
+{
+    struct timespec ts = {};
+    double out = 0;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0)
+        out = ((double) ts.tv_sec) + ((double) ts.tv_nsec) / 1000000000L;
+
+    return out;
+}
+
+static void
+dump_perf(json_t *time)
+{
+    const char *key = NULL;
+    bool first = true;
+    json_t *val = 0;
+
+    json_object_foreach(time, key, val) {
+        int v = 0;
+
+        if (!first)
+            printf(" ");
+        else
+            first = false;
+
+        if (json_is_integer(val))
+            v = json_integer_value(val);
+        else if (json_is_real(val))
+            v = json_real_value(val) * 1000000;
+
+        printf("%s=%d", key, v);
+    }
+}
+
+static int
+nagios(int argc, char *argv[])
+{
+    enum {
+        NAGIOS_OK = 0,
+        NAGIOS_WARN = 1,
+        NAGIOS_CRIT = 2,
+        NAGIOS_UNKN = 3
+    } ret = NAGIOS_CRIT;
+    char url[8192] = {};
+    json_t *time = NULL;
+    json_t *keys = NULL;
+    json_t *adv = NULL;
+    size_t sig = 0;
+    size_t rec = 0;
+    double s = 0;
+    double e = 0;
+    int r = 0;
+
+    time = json_object();
+    if (!time)
+        goto egress;
+
+    snprintf(url, sizeof(url), "%s/adv", argv[2]);
+    s = curtime();
+    r = http(url, HTTP_GET, NULL, &adv);
+    e = curtime();
+    if (r != 200) {
+        if (r < 0)
+            printf("Error fetching advertisement! %s\n", strerror(-r));
+        else
+            printf("Error fetching advertisement! HTTP Status %d\n", r);
+
+        goto egress;
+    }
+
+    if (s == 0.0 || e == 0.0 ||
+        json_object_set_new(time, "adv", json_real(e - s)) != 0) {
+        printf("Error calculating performance metrics!\n");
+        goto egress;
+    }
+
+    keys = adv_vld(adv);
+    if (!keys) {
+        printf("Error validating advertisement!\n");
+        goto egress;
+    }
+
+    for (size_t i = 0; i < json_array_size(keys); i++) {
+        json_t *jwk = json_array_get(keys, i);
+        const char *kid = NULL;
+        json_t *state = NULL;
+        json_t *bef = NULL;
+        json_t *aft = NULL;
+        json_t *req = NULL;
+        json_t *rep = NULL;
+
+        if (jose_jwk_allowed(jwk, true, NULL, "verify")) {
+            sig++;
+            continue;
+        }
+
+        if (!jose_jwk_allowed(jwk, true, NULL, "tang.derive") &&
+            !jose_jwk_allowed(jwk, true, NULL, "wrapKey"))
+            continue;
+
+        bef = json_pack("{s:s,s:i}", "kty", "oct", "bytes", 16);
+        if (!bef) {
+            printf("Error creating JWK template!\n");
+            goto egress;
+        }
+
+        state = adv_rep(jwk, bef);
+        if (!state) {
+            printf("Error creating binding!\n");
+            goto egress;
+        }
+
+        req = rec_req(state);
+        if (!req) {
+            printf("Error preparing recovery request!\n");
+            goto egress;
+        }
+
+        snprintf(url, sizeof(url), "%s/rec", argv[2]);
+        s = curtime();
+        r = http(url, HTTP_POST, req, &rep);
+        e = curtime();
+        if (r != 200) {
+            if (r < 0)
+                printf("Error performing recovery! %s\n", strerror(-r));
+            else
+                printf("Error performing recovery! HTTP Status %d\n", r);
+
+            goto egress;
+        }
+
+        if (json_unpack(jwk, "{s:s}", "kid", &kid) != 0)
+            goto egress;
+
+        if (s == 0.0 || e == 0.0 ||
+            json_object_set_new(time, kid, json_real(e - s)) < 0) {
+            printf("Error calculating performance metrics!\n");
+            goto egress;
+        }
+
+        aft = rec_rep(state, rep);
+        if (!aft) {
+            printf("Error handing recovery result!\n");
+            goto egress;
+        }
+
+        if (!json_equal(bef, aft)) {
+            printf("Recovered key doesn't match!\n");
+            goto egress;
+        }
+
+        json_decref(state);
+        json_decref(bef);
+        json_decref(aft);
+        json_decref(req);
+        json_decref(rep);
+
+        rec++;
+    }
+
+    if (rec == 0) {
+        printf("Advertisement contains no recovery keys!\n");
+        goto egress;
+    }
+
+    json_object_set_new(time, "nkeys", json_integer(json_array_size(keys)));
+    json_object_set_new(time, "nsigk", json_integer(sig));
+    json_object_set_new(time, "nreck", json_integer(rec));
+
+    printf("OK|");
+    dump_perf(time);
+    printf("\n");
+    ret = NAGIOS_OK;
+
+egress:
+    json_decref(time);
+    json_decref(keys);
+    json_decref(adv);
+    return ret;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -323,7 +507,11 @@ main(int argc, char *argv[])
     if (argc == 2 && strcmp(argv[1], "decrypt") == 0)
         return decrypt(argc, argv);
 
+    if (argc == 3 && strcmp(argv[1], "nagios") == 0)
+        return nagios(argc, argv);
+
     fprintf(stderr, "Usage: %s encrypt CONFIG\n", argv[0]);
     fprintf(stderr, "   or: %s decrypt\n", argv[0]);
+    fprintf(stderr, "   or: %s nagios  URL\n", argv[0]);
     return EXIT_FAILURE;
 }

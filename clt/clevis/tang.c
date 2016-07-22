@@ -162,10 +162,9 @@ select_jwk(json_t *jws)
 }
 
 static int
-provision(int argc, char *argv[])
+encrypt(int argc, char *argv[])
 {
     int ret = EXIT_FAILURE;
-    const char *adv = NULL;
     const char *url = NULL;
     json_t *jws = NULL;
     json_t *cfg = NULL;
@@ -173,7 +172,6 @@ provision(int argc, char *argv[])
     json_t *jwe = NULL;
     json_t *cek = NULL;
     json_t *ste = NULL;
-    json_t *out = NULL;
     uint8_t *ky = NULL;
     size_t kyl = 0;
 
@@ -190,15 +188,24 @@ provision(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (json_unpack(cfg, "{s:s,s?s}", "url", &url, "adv", &adv) != 0) {
+    if (json_unpack(cfg, "{s:s,s?o}", "url", &url, "adv", &jws) != 0) {
         fprintf(stderr, "Invalid configuration!\n");
         goto egress;
     }
 
-    if (adv)
-        jws = load_adv(adv);
-    else
+    if (json_is_string(jws))
+        jws = load_adv(json_string_value(jws));
+    else if (!json_is_object(jws))
         jws = dnld_adv(url);
+    else {
+        json_t *keys = adv_vld(jws);
+        if (!keys) {
+            fprintf(stderr, "Specified advertisement is invalid!\n");
+            goto egress;
+        }
+
+        json_decref(keys);
+    }
 
     jwk = select_jwk(jws);
     if (!jwk) {
@@ -216,7 +223,14 @@ provision(int argc, char *argv[])
         goto egress;
     }
 
-    jwe = json_pack("{s:{s:s}}", "protected", "alg", "dir");
+    jwe = json_pack("{s:{s:s},s:{s:{s:s,s:O,s:O}}}",
+                    "protected",
+                        "alg", "dir",
+                    "unprotected",
+                        "tang",
+                            "url", url,
+                            "ste", ste,
+                            "adv", jws);
     if (!jwe) {
         fprintf(stderr, "Error creating JWE template!\n");
         goto egress;
@@ -227,12 +241,7 @@ provision(int argc, char *argv[])
         goto egress;
     }
 
-    out = json_pack("{s:s,s:O,s:O,s:O}",
-                    "url", url, "state", ste, "jwe", jwe, "jws", jws);
-    if (!out)
-        goto egress;
-
-    if (json_dumpf(out, stdout, JSON_SORT_KEYS | JSON_COMPACT) != 0)
+    if (json_dumpf(jwe, stdout, JSON_SORT_KEYS | JSON_COMPACT) != 0)
         goto egress;
 
     ret = EXIT_SUCCESS;
@@ -250,7 +259,7 @@ egress:
 }
 
 static int
-recover(int argc, char *argv[])
+decrypt(int argc, char *argv[])
 {
     int ret = EXIT_FAILURE;
     const char *url = NULL;
@@ -260,17 +269,16 @@ recover(int argc, char *argv[])
     json_t *req = NULL;
     json_t *rep = NULL;
     json_t *cek = NULL;
-    json_t *inp = NULL;
     uint8_t *ky = NULL;
     size_t kyl = 0;
     int r = 0;
 
-    inp = json_loadf(stdin, 0, NULL);
-    if (!inp)
+    jwe = json_loadf(stdin, 0, NULL);
+    if (!jwe)
         goto egress;
 
-    if (json_unpack(inp, "{s:s,s:o,s:o}",
-                    "url", &url, "state", &ste, "jwe", &jwe) != 0)
+    if (json_unpack(jwe, "{s:{s:{s:s,s:o}}}",
+                    "unprotected", "tang", "url", &url, "ste", &ste) != 0)
         goto egress;
 
     req = rec_req(ste);
@@ -301,7 +309,7 @@ egress:
     json_decref(req);
     json_decref(rep);
     json_decref(cek);
-    json_decref(inp);
+    json_decref(jwe);
     free(ky);
     return ret;
 }
@@ -309,11 +317,13 @@ egress:
 int
 main(int argc, char *argv[])
 {
-    if (argc == 3 && strcmp(argv[1], "provision") == 0)
-        return provision(argc, argv);
+    if (argc == 3 && strcmp(argv[1], "encrypt") == 0)
+        return encrypt(argc, argv);
 
-    if (argc == 2 && strcmp(argv[1], "recover") == 0)
-        return recover(argc, argv);
+    if (argc == 2 && strcmp(argv[1], "decrypt") == 0)
+        return decrypt(argc, argv);
 
+    fprintf(stderr, "Usage: %s encrypt CONFIG\n", argv[0]);
+    fprintf(stderr, "   or: %s decrypt\n", argv[0]);
     return EXIT_FAILURE;
 }

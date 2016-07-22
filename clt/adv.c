@@ -120,7 +120,7 @@ wrap(const json_t *jwk, json_t *jwkt, size_t bytes)
     if (RAND_bytes(ky, sizeof(ky)) <= 0)
         return false;
 
-    if (json_object_set(jwkt, "k", jose_b64_encode_json(ky, bytes)) != 0)
+    if (json_object_set_new(jwkt, "k", jose_b64_encode_json(ky, bytes)) != 0)
         goto egress;
 
     for (size_t i = 0; i < bytes; i++)

@@ -180,6 +180,21 @@ adv_vld(const json_t *jws)
 
     for (size_t i = 0; i < json_array_size(keys); i++) {
         json_t *key = json_array_get(keys, i);
+        const char *kid = NULL;
+        char *thp = NULL;
+        bool eq = false;
+
+        if (json_unpack(key, "{s:s}", "kid", &kid) != 0)
+            goto error;
+
+        thp = jose_jwk_thumbprint(key, "sha256");
+        if (!thp)
+            goto error;
+
+        eq = strcmp(thp, kid) == 0;
+        free(thp);
+        if (!eq)
+            goto error;
 
         if (!jose_jwk_allowed(key, true, NULL, "verify"))
             continue;

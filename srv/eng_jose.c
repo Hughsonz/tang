@@ -147,7 +147,6 @@ load_jwks(const char *db, const char *name)
     json_decref(jwkset);
 
     json_array_foreach(arr, i, jwk) {
-        const char *use = NULL;
         const char *msg = NULL;
         json_t *kid = NULL;
 
@@ -155,11 +154,8 @@ load_jwks(const char *db, const char *name)
         if (json_object_set_new(jwk, "kid", kid) < 0)
             msg = "Error making JWK thumbprint!";
 
-        else if (json_unpack(jwk, "{s?s}", "use", &use) == -1)
-            msg = "Error unpacking JWK!";
-
-        else if (!use)
-            msg = "Not loading JWK without use!";
+        else if (json_unpack(jwk, "{s:[]}", "key_ops") == -1)
+            msg = "Not loading JWK without key_ops!";
 
         if (msg) {
             fprintf(stderr, "%s %s", msg, fn);

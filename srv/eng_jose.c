@@ -484,17 +484,21 @@ eng_adv(json_t *ctx, const char *kid, json_t **rep)
 }
 
 static eng_err_t
-anon(json_t *ctx, const char *key, const json_t *jwk, json_t **rep)
+anon(json_t *ctx, const json_t *jwk, json_t **rep)
 {
     eng_err_t err = ENG_ERR_INTERNAL;
     const EC_GROUP *grp = NULL;
+    const char *kid = NULL;
     json_t *prv = NULL;
     EC_KEY *lcl = NULL;
     EC_KEY *rem = NULL;
     BN_CTX *bnc = NULL;
     EC_POINT *r = NULL;
 
-    if (json_unpack(ctx, "{s:{s:o}}", "rec", key, &prv) == -1)
+    if (json_unpack((json_t *) jwk, "{s:s}", "kid", &kid) != 0)
+        return ENG_ERR_BAD_REQ;
+
+    if (json_unpack(ctx, "{s:{s:o}}", "rec", kid, &prv) == -1)
         return ENG_ERR_BAD_REQ;
 
     if (!jose_jwk_allowed(prv, true, NULL, "tang.recover"))
@@ -586,7 +590,6 @@ eng_rec(json_t *ctx, const json_t *req, json_t **rep)
 {
     eng_err_t err = ENG_ERR_BAD_REQ;
     const json_t *jwe = NULL;
-    const json_t *jwk = NULL;
     const char *key = NULL;
     const char *otp = NULL;
     const char *bid = NULL;
@@ -599,9 +602,9 @@ eng_rec(json_t *ctx, const json_t *req, json_t **rep)
     *rep = NULL;
 
     /* If we receive an anonymous request, handle it. */
-    if (json_unpack((json_t *) req, "{s:s,s:o!}",
-                    "kid", &key, "jwk", &jwk) == 0)
-        return anon(ctx, key, jwk, rep);
+    if (json_unpack_ex((json_t *) req, NULL, JSON_VALIDATE_ONLY,
+                       "{s:s}", "kty") == 0)
+        return anon(ctx, req, rep);
 
     rec = decrypt(ctx, req, NULL);
     if (!rec)

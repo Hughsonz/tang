@@ -16,7 +16,7 @@ PKG_PROG_PKG_CONFIG([0.25])
 AC_CHECK_HEADER([http_parser.h], [], [AC_MSG_ERROR([http-parser required!])])
 AC_SEARCH_LIBS([http_parser_execute], [http_parser], [], [AC_MSG_ERROR([http-parser required!])])
 PKG_CHECK_MODULES([libcrypto], [libcrypto])
-PKG_CHECK_MODULES([jose], [jose])
+PKG_CHECK_MODULES([jose], [jose-openssl])
 PKG_CHECK_MODULES([systemd], [systemd],
 		  [AC_SUBST([systemdsystemunitdir], [$($PKG_CONFIG --variable=systemdsystemunitdir systemd)])],
 		  [AC_SUBST([systemdsystemunitdir], [${prefix}/lib/systemd/system])])

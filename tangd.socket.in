@@ -3,7 +3,7 @@ Description=Tang daemon socket
 ConditionDirectoryNotEmpty=@TANG_DB@
 
 [Socket]
-ListenStream=@TANG_PORT@
+ListenStream=80
 Accept=true
 
 [Install]

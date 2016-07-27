@@ -4,8 +4,6 @@ AC_CANONICAL_SYSTEM
 AC_PROG_CC_C99
 AC_PROG_SED
 
-AC_CHECK_LIB([rt], [clock_gettime], [LIBS="-lrt $LIBS"])
-
 AM_INIT_AUTOMAKE([subdir-objects foreign no-dist-gzip dist-bzip2 parallel-tests])
 AM_SILENT_RULES([yes])
 AM_PROG_CC_C_O
@@ -42,11 +40,5 @@ TANG_CFLAGS="\
 "
 AC_SUBST([TANG_CFLAGS])
 
-AC_SUBST([TANG_PORT], [5700])
-AC_DEFINE([TANG_PORT], [5700])
-
-AC_CONFIG_FILES([
-    Makefile
-    srv/Makefile
-])
+AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

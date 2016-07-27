@@ -48,7 +48,5 @@ AC_DEFINE([TANG_PORT], [5700])
 AC_CONFIG_FILES([
     Makefile
     srv/Makefile
-    clt/Makefile
-    tests/Makefile
 ])
 AC_OUTPUT

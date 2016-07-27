@@ -1,2 +1,2 @@
-SUBDIRS = srv clt tests
+SUBDIRS = srv
 EXTRA_DIST = COPYING COPYING.openssl
